@@ -25,7 +25,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | configurable | Switch to previous session |
 | configurable | Open plan in editor |
 | configurable | Toggle plan panel |
-| configurable | Open tasks |
+| configurable | Open subtasks |
 | configurable | Model picker |
 
 ## Editing
@@ -105,7 +105,7 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+P` | Browse sessions |
+| `Ctrl+P` | Input history |
 | `Ctrl+X` | Open tasks |
 | `Ctrl+T` | Thinking effort |
 | `Ctrl+G` | Inspect background jobs |
@@ -148,5 +148,6 @@ The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.
 These are input conventions, not remappable key rows:
 
 - Prefix a line with `!` to run a shell command yourself (5 minute timeout). Use `!!` to hide the command and its output from the agent.
+- Prefix a line with `$` to call a tool yourself, the same tools the agent uses (`$grep TODO`, `$read src/main.rs`). Arguments are `key=value` pairs or a JSON object, and bare values fill the tool's string parameters in order. `$$` hides the call and its output from the agent. Typing `$` opens a popup of tool names, and after the name it offers the tool's parameters: `Tab` or `Enter` completes the selected row inline (Enter with nothing typed submits the call), `Up`/`Down` move, `Esc` closes. custom_tools registrations are in the list too, completing to the `$bash` line that runs them.
 - `Ctrl+V` pastes an image from the clipboard into the prompt when the model supports vision. You can also paste image file paths.
 - Middle-click inserts the PRIMARY selection, the same text middle-click pastes in a shell. Linux only, since other platforms have no PRIMARY selection. On Wayland the compositor must support it.

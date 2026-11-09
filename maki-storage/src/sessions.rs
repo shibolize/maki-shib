@@ -37,8 +37,10 @@ const MLOGS_DIR: &str = "mlogs";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const CWD_INDEX_STEM: &str = "cwd_latest";
 /// Readable links to session logs, filed as `by-path/<folder>/<ts>-<alias>.jsonl`.
+#[cfg(unix)]
 const BY_PATH_DIR: &str = "by-path";
 /// How a session's creation time shows up in its link name, always UTC.
+#[cfg(unix)]
 const LINK_TIME_FORMAT: &str = "%Y-%m-%d-%H-%M-%S";
 /// Alias for a cwd [`Path::file_name`] cannot name, and for names that
 /// sanitize down to nothing.
@@ -1600,6 +1602,7 @@ fn default_alias(cwd: &str) -> String {
         .to_owned()
 }
 
+#[cfg(unix)]
 fn link_stamp(created_at: u64) -> Option<String> {
     let seconds = i64::try_from(created_at).ok()?;
     jiff::Timestamp::from_second(seconds)
@@ -1609,6 +1612,7 @@ fn link_stamp(created_at: u64) -> Option<String> {
 
 /// One path component of a link name: anything a shell or a filesystem would
 /// trip on becomes `-`.
+#[cfg(unix)]
 fn link_component(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -1627,6 +1631,7 @@ fn link_component(name: &str) -> String {
 /// becomes `--` and odd characters become `-`. Two paths can in principle
 /// collapse into one folder; the index holds the real mapping and this is
 /// only a view over it.
+#[cfg(unix)]
 fn view_dir_name(cwd: &str) -> String {
     let folder: String = cwd
         .trim_start_matches('/')
@@ -2559,13 +2564,13 @@ mod tests {
     use super::StoredThinking;
     use super::ThinkingParseError;
     #[cfg(unix)]
-    use super::canonical_key;
+    use super::{BY_PATH_DIR, canonical_key, link_stamp};
     use super::{
-        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, BY_PATH_DIR, CWD_INDEX_FILE, DEFAULT_TITLE,
-        LOG_BLOATED, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR,
-        StoredSubagent, TAIL_BUF, cwd_theme, cwd_thinking, generate_title, json_path, jsonl_path,
-        latest_id_in, link_stamp, load_cwd_index, lock_path, locks_dir, next_epoch, set_cwd_alias,
-        set_cwd_theme, set_cwd_thinking, update_cwd_index, write_full_session,
+        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
+        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
+        TAIL_BUF, cwd_theme, cwd_thinking, generate_title, json_path, jsonl_path, latest_id_in,
+        load_cwd_index, lock_path, locks_dir, next_epoch, set_cwd_alias, set_cwd_theme,
+        set_cwd_thinking, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog,

@@ -15,6 +15,7 @@ pub(crate) mod shell;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod user_tool;
 pub(crate) mod view;
 
 use std::collections::HashMap;
@@ -63,6 +64,7 @@ use crate::components::system_prompt_modal::{
     SystemPromptAction, SystemPromptModal, WIDTH_PERCENT,
 };
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
+use crate::components::tool_palette::{ToolAction, ToolPalette};
 use crate::components::tool_prompt_modal::{ToolPromptAction, ToolPromptModal};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
@@ -75,6 +77,7 @@ use crate::theme;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
+use maki_agent::tools::ToolRegistry;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     RunInterrupt, SharedMessages, SubagentInfo,
@@ -384,6 +387,7 @@ pub struct App {
     pub(super) chat_index: HashMap<String, usize>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
+    pub(super) tool_palette: ToolPalette,
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
@@ -580,6 +584,7 @@ impl App {
                 mcp_reader.clone(),
                 lua_command_reader,
             ),
+            tool_palette: ToolPalette::new(),
             theme_picker: ThemePicker::new(),
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
@@ -791,6 +796,17 @@ impl App {
         })
     }
 
+    /// What `maki.ui.input_history` hands to Lua: the prompts the up and down
+    /// keys recall, newest first.
+    pub(crate) fn input_history(&self) -> serde_json::Value {
+        let history = self.input_box.history();
+        let entries: Vec<&str> = (0..history.len())
+            .rev()
+            .filter_map(|i| history.get(i))
+            .collect();
+        serde_json::json!(entries)
+    }
+
     /// Refuses an edit the input has moved on from: another tab now focused, a
     /// version the buffer has left behind, or a range it has outgrown. See
     /// [`InputBox::replace_range`].
@@ -839,7 +855,10 @@ impl App {
     /// tick diff reports those unlabelled: the version stamped here no longer
     /// matches what they left.
     fn input_changed(&mut self, writer: InputWriter) {
-        self.command_palette.sync(&self.input_box.buffer.value());
+        let value = self.input_box.buffer.value();
+        self.command_palette.sync(&value);
+        let cwd = self.state.session.cwd.clone();
+        self.tool_palette.sync(&value, &self.storage, &cwd);
         self.input_writer = self.input_writer.take().merge(writer);
     }
 
@@ -1189,7 +1208,6 @@ impl App {
             return None;
         }
         if key::QUIT.matches(key) {
-            self.command_palette.close();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
                     return Some(self.handle_cancel());
@@ -1197,11 +1215,18 @@ impl App {
                 self.quit()
             } else {
                 self.input_box.discard();
+                self.input_changed(InputWriter::Anyone);
                 vec![]
             });
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
+        }
+        if key::PREV_CHAT.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::PrevChat));
+        }
+        if key::NEXT_CHAT.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::NextChat));
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
@@ -1715,6 +1740,19 @@ impl App {
             }
         }
 
+        if self.is_main_chat() && !is_ctrl(&key) {
+            match self.tool_palette.handle_key(key) {
+                ToolAction::Consumed => return Some(vec![]),
+                ToolAction::Complete(text) => {
+                    self.input_box.set_input(text);
+                    self.input_box.buffer.move_to_end();
+                    self.input_changed(InputWriter::Anyone);
+                    return Some(vec![]);
+                }
+                ToolAction::Passthrough => {}
+            }
+        }
+
         None
     }
 
@@ -1831,7 +1869,9 @@ impl App {
 
         if !self.is_main_chat() {
             return match key.code {
-                KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                KeyCode::Tab if !self.is_bash_input() && !self.is_tool_input() => {
+                    self.toggle_mode()
+                }
                 // A paused task's pane goes finished when its tool returns, so
                 // liveness is what keeps the dismiss Esc reachable after it.
                 KeyCode::Esc if self.task_pane_takes_esc() => {
@@ -1965,7 +2005,13 @@ impl App {
         }
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
-            InputAction::Submit(sub) => self.handle_submit(sub),
+            InputAction::Submit(sub) => {
+                // `submit` empties the buffer without a `Changed`, so the
+                // palettes resync here or the helper outlives its input.
+                let actions = self.handle_submit(sub);
+                self.input_changed(InputWriter::Anyone);
+                actions
+            }
             InputAction::Changed => {
                 self.input_changed(InputWriter::Anyone);
                 vec![]
@@ -1983,7 +2029,9 @@ impl App {
                         self.active_chat().scroll(-1);
                         vec![]
                     }
-                    KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                    KeyCode::Tab if !self.is_bash_input() && !self.is_tool_input() => {
+                        self.toggle_mode()
+                    }
                     KeyCode::Esc => {
                         if let Some(t) = self.last_esc.take()
                             && t.elapsed() < self.status_bar.flash_duration
@@ -2130,6 +2178,30 @@ impl App {
             return vec![Action::ShellCommand {
                 id,
                 command: prefix.command,
+                visible: prefix.visible,
+            }];
+        }
+        if let Some(prefix) = user_tool::parse_user_tool_prefix(&sub.text) {
+            let Some(entry) = ToolRegistry::global().get(&prefix.name) else {
+                self.flash(format!("unknown tool: ${}", prefix.name));
+                return vec![];
+            };
+            let input = match user_tool::build_tool_input(&prefix.args, &entry.tool.schema()) {
+                Ok(input) => input,
+                Err(err) => {
+                    self.flash(err);
+                    return vec![];
+                }
+            };
+            let id = self.shell.reserve_id();
+            let sigil = if prefix.visible { "$" } else { "$$" };
+            let display = format!("{sigil} {} {}", prefix.name, prefix.args);
+            self.main_chat()
+                .show_user_message(display.trim_end().to_owned(), Vec::new());
+            return vec![Action::UserToolCommand {
+                id,
+                name: prefix.name,
+                input,
                 visible: prefix.visible,
             }];
         }
@@ -2748,6 +2820,7 @@ impl App {
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
+        chat.mark_started();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }

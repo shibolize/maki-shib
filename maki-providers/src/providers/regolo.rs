@@ -19,7 +19,9 @@ use crate::types::{ModelUsageRow, ProviderUsage, UsageLimit};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation, reload_key_pool,
+};
 
 const SLUG: &str = "regolo";
 const DISPLAY_NAME: &str = "Regolo";
@@ -300,7 +302,7 @@ impl Regolo {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
                 CONFIG.slug,
-                pool.current(),
+                &pool.current(),
             )?)),
             key_pool: Some(pool),
             system_prefix: None,
@@ -414,6 +416,18 @@ impl Provider for Regolo {
                 limits,
                 by_model_today,
             }))
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            reload_key_pool(
+                CONFIG.slug,
+                CONFIG.api_key_env,
+                &self.key_pool,
+                &self.auth,
+                KeyHeader::Bearer,
+            )
         })
     }
 

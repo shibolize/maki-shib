@@ -17,7 +17,8 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, 
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body};
 use super::{
-    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek, key_rotation, sort_models,
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek, key_rotation,
+    reload_key_pool, sort_models,
 };
 
 /// TensorX namespaces resold models by vendor, so DeepSeek ids arrive as
@@ -113,7 +114,7 @@ impl TensorX {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
                 CONFIG.slug,
-                pool.current(),
+                &pool.current(),
             )?)),
             key_pool: Some(pool),
             system_prefix: None,
@@ -199,6 +200,18 @@ impl Provider for TensorX {
                 .unwrap_or_default();
             sort_models(&mut models);
             Ok(models)
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            reload_key_pool(
+                CONFIG.slug,
+                CONFIG.api_key_env,
+                &self.key_pool,
+                &self.auth,
+                KeyHeader::Bearer,
+            )
         })
     }
 

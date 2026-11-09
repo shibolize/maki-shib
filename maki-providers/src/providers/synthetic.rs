@@ -15,7 +15,9 @@ use crate::spec::{
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation, reload_key_pool,
+};
 
 const SLUG: &str = "synthetic";
 const DISPLAY_NAME: &str = "Synthetic";
@@ -100,7 +102,7 @@ impl Synthetic {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
                 CONFIG.slug,
-                pool.current(),
+                &pool.current(),
             )?)),
             key_pool: Some(pool),
             system_prefix: None,
@@ -152,6 +154,18 @@ impl Provider for Synthetic {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             self.compat.do_list_models(&auth).await
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            reload_key_pool(
+                CONFIG.slug,
+                CONFIG.api_key_env,
+                &self.key_pool,
+                &self.auth,
+                KeyHeader::Bearer,
+            )
         })
     }
 

@@ -19,7 +19,10 @@ use crate::{
 
 use super::auth;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::providers::{ResolvedAuth, refreshed_tokens};
+use crate::providers::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, key_rotation, refreshed_tokens,
+    run_stream_attempt,
+};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: super::SLUG,
@@ -279,6 +282,7 @@ struct CodexUsageWindow {
 pub struct OpenAi {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
+    key_pool: Option<KeyPool>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
     /// Env / `providers.toml` override for the platform API, resolved once at
@@ -290,12 +294,13 @@ pub struct OpenAi {
 impl OpenAi {
     pub fn new(timeouts: crate::providers::Timeouts) -> Result<Self, AgentError> {
         let storage = StateDir::resolve()?;
-        let resolved = auth::resolve(&storage)?;
+        let (resolved, pool) = auth::resolve_with_pool(&storage)?;
         let compat = OpenAiCompatProvider::new(&CONFIG, timeouts)?;
         Ok(Self {
             resolved_base_url: resolve_openai_base_url(),
             compat,
             auth: Arc::new(Mutex::new(resolved)),
+            key_pool: Some(pool),
             storage: Some(storage),
             system_prefix: None,
         })
@@ -309,6 +314,7 @@ impl OpenAi {
             resolved_base_url: resolve_openai_base_url(),
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth,
+            key_pool: None,
             storage: None,
             system_prefix: None,
         })
@@ -373,17 +379,37 @@ impl OpenAi {
         result
     }
 
-    fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
-        // Prefer OAuth tokens for the ChatGPT Coding Plan backend.
-        if let Some(storage) = self.storage.as_ref()
-            && let Some(tokens) = maki_storage::auth::load_tokens(storage, auth::PROVIDER)
+    async fn stream_with_oauth_retry<F, Fut>(
+        &self,
+        event_tx: &Sender<ProviderEvent>,
+        f: F,
+    ) -> Result<StreamResponse, AgentError>
+    where
+        F: Fn(Sender<ProviderEvent>) -> Fut,
+        Fut: std::future::Future<Output = Result<StreamResponse, AgentError>>,
+    {
+        let (result, forwarded) = run_stream_attempt(event_tx, &f).await;
+        if forwarded == 0
+            && self.is_oauth()
+            && matches!(&result, Err(e) if e.is_auth_error())
+            && self.refresh_oauth().await.is_ok()
         {
-            return auth::build_coding_plan_resolved(&tokens);
+            return f(event_tx.clone()).await;
+        }
+        result
+    }
+
+    fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
+        let mut auth = self.current_auth();
+        // Prefer OAuth tokens for the ChatGPT Coding Plan backend, reading the
+        // live in-memory auth so refreshes take effect immediately.
+        if self.is_oauth() {
+            auth.base_url = Some(auth::CODING_PLAN_BASE_URL.into());
+            return Ok(auth);
         }
         // Fall back to standard API key via the Responses API. Env /
         // providers.toml base_url overrides the platform API only, never the
         // ChatGPT backend above.
-        let mut auth = self.current_auth();
         if auth.base_url.is_none() {
             auth.base_url = self
                 .resolved_base_url
@@ -513,22 +539,24 @@ impl Provider for OpenAi {
                 .or_else(|| is_codex_model(&model.id).then(|| plan_dialect(&model.id).clone()));
             if let Some(dialect) = plan_dialect {
                 let stream_timeout = self.compat.stream_timeout();
+                let dialect = &dialect;
+                let discovered = discovered.as_deref();
                 return self
-                    .with_oauth_retry(|| async {
+                    .stream_with_oauth_retry(event_tx, |tx| async move {
                         let codex_auth = self.codex_auth()?;
                         let mut body = super::responses::build_body(model, messages, system, tools);
                         super::responses::apply_responses_reasoning(
                             &mut body,
                             opts.thinking,
                             model,
-                            &dialect,
+                            dialect,
                         );
-                        apply_plan_fast(&mut body, opts.fast, &codex_auth, discovered.as_deref());
+                        apply_plan_fast(&mut body, opts.fast, &codex_auth, discovered);
                         super::responses::do_stream(
                             self.compat.client(),
                             model,
                             &body,
-                            event_tx,
+                            &tx,
                             &codex_auth,
                             stream_timeout,
                         )
@@ -543,11 +571,10 @@ impl Provider for OpenAi {
                 model,
                 ThinkingFallback::Dialect(&dialect::STANDARD),
             );
-            self.with_oauth_retry(|| async {
+            let body = &body;
+            self.stream_with_oauth_retry(event_tx, |tx| async move {
                 let auth = self.current_auth();
-                self.compat
-                    .do_stream(model, &[], &body, event_tx, &auth)
-                    .await
+                self.compat.do_stream(model, &[], body, &tx, &auth).await
             })
             .await
         })
@@ -603,11 +630,19 @@ impl Provider for OpenAi {
             let Some(storage) = self.storage.clone() else {
                 return Ok(());
             };
-            let resolved = smol::unblock(move || auth::resolve(&storage)).await?;
+            let (resolved, new_pool) =
+                smol::unblock(move || auth::resolve_with_pool(&storage)).await?;
+            if let Some(pool) = &self.key_pool {
+                pool.replace(new_pool);
+            }
             *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = resolved;
             debug!("reloaded OpenAI auth from storage");
             Ok(())
         })
+    }
+
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        key_rotation(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 
     /// An api-key user gets no opinion at all: stamping `Unsupported` here

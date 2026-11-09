@@ -11,6 +11,7 @@ use test_case::test_case;
 #[test_case("lib", include_str!("../../plugins/lib/tests/spec.lua") ; "lib_spec")]
 #[test_case("list", include_str!("../../plugins/list/tests/spec.lua") ; "list_plugin_spec")]
 #[test_case("memory", include_str!("../../plugins/memory/tests/spec.lua") ; "memory_plugin_spec")]
+#[test_case("custom_tools", include_str!("../../plugins/custom_tools/tests/spec.lua") ; "custom_tools_plugin_spec")]
 #[test_case("question", include_str!("../../plugins/question/tests/spec.lua") ; "question_plugin_spec")]
 #[test_case("read", include_str!("../../plugins/read/tests/spec.lua") ; "read_plugin_spec")]
 #[test_case("skill", include_str!("../../plugins/skill/tests/spec.lua") ; "skill_plugin_spec")]
@@ -18,6 +19,7 @@ use test_case::test_case;
 #[test_case("subtask", include_str!("../../plugins/subtask/tests/spec.lua") ; "subtask_plugin_spec")]
 #[test_case("thinking", include_str!("../../plugins/thinking/tests/spec.lua") ; "thinking_plugin_spec")]
 #[test_case("view_image", include_str!("../../plugins/view_image/tests/spec.lua") ; "view_image_plugin_spec")]
+#[test_case("input_history", include_str!("../../plugins/input_history/tests/spec.lua") ; "input_history_plugin_spec")]
 #[test_case("cronjob", include_str!("../../plugins/cronjob/tests/spec.lua") ; "cronjob_plugin_spec")]
 #[test_case("create_plugin", include_str!("../../plugins/create_plugin/tests/spec.lua") ; "create_plugin_plugin_spec")]
 #[test_case("aa_scores", include_str!("../../plugins/aa_scores/tests/spec.lua") ; "aa_scores_plugin_spec")]
@@ -26,6 +28,7 @@ use test_case::test_case;
 #[test_case("write", include_str!("../../plugins/write/tests/spec.lua") ; "write_plugin_spec")]
 #[test_case("terminal_progress", include_str!("../../plugins/terminal_progress/tests/spec.lua") ; "terminal_progress_plugin_spec")]
 #[test_case("tool_help", include_str!("../../plugins/tool_help/tests/spec.lua") ; "tool_help_plugin_spec")]
+#[test_case("transcript", include_str!("../../plugins/transcript/tests/spec.lua") ; "transcript_plugin_spec")]
 fn plugin_spec(name: &str, spec: &str) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

@@ -1705,6 +1705,27 @@ fn chat_navigation_actions() {
     assert_eq!(app.active_chat, 0);
 }
 
+/// `prev_chat`/`next_chat` are advertised binds, so the keys themselves have
+/// to move between chats, not only the builtin actions.
+#[test]
+fn chat_navigation_keys_switch_task_chats() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "sub".into() },
+        TASK_ID,
+        Some("research"),
+    ));
+    assert_eq!(app.chats.len(), 2);
+
+    app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
+    assert_eq!(app.active_chat, 1);
+
+    app.update(Msg::Key(kb::PREV_CHAT.to_key_event()));
+    assert_eq!(app.active_chat, 0);
+}
+
 #[test]
 fn subagents_get_descriptive_names() {
     let mut app = test_app();
@@ -2167,14 +2188,29 @@ fn tasks_report_main_chat_then_subagent_outcomes() {
     finish_subagent(&mut app, "task1", false);
     finish_subagent(&mut app, "task2", true);
 
-    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    let mut tasks = serde_json::to_value(app.tasks()).unwrap();
+    // The wall-clock stamps vary per run; only their presence per chat kind is
+    // pinned: every subagent spawned here is live, the main chat has neither.
+    for entry in tasks.as_array_mut().unwrap() {
+        let obj = entry.as_object_mut().unwrap();
+        let started = obj.remove("started_at");
+        let ended = obj.remove("ended_at");
+        if obj["id"] == "main" {
+            assert!(started.is_none() && ended.is_none());
+        } else {
+            let stamp =
+                |v: &Option<serde_json::Value>| v.as_ref().is_some_and(serde_json::Value::is_u64);
+            assert!(stamp(&started));
+            assert_eq!(stamp(&ended), obj["status"] != "working");
+        }
+    }
     assert_eq!(
         tasks,
         serde_json::json!([
-            { "id": "main", "name": "Main", "focused": true },
-            { "id": "task1", "name": "research", "status": "done", "focused": false },
-            { "id": "task2", "name": "build", "status": "error", "focused": false },
-            { "id": "task3", "name": "deploy", "status": "working", "focused": false },
+            { "id": "main", "name": "Main", "focused": true, "context": 0 },
+            { "id": "task1", "name": "research", "status": "done", "focused": false, "context": 0 },
+            { "id": "task2", "name": "build", "status": "error", "focused": false, "context": 0 },
+            { "id": "task3", "name": "deploy", "status": "working", "focused": false, "context": 0 },
         ])
     );
 }
@@ -2770,6 +2806,16 @@ fn input_snapshot_offsets_are_byte_offsets() {
     let cursor = st["cursor"].as_u64().unwrap() as usize;
     assert_eq!(cursor, 6);
     assert_eq!(&text[..cursor], "日本", "the offset has to slice the value");
+}
+
+#[test]
+fn input_history_is_newest_first() {
+    let mut app = test_app();
+    for prompt in ["first", "second"] {
+        app.input_box.set_input(prompt.into());
+        app.input_box.submit();
+    }
+    assert_eq!(app.input_history(), serde_json::json!(["second", "first"]));
 }
 
 /// The line and column the cursor sits on are a slice of `text` and `cursor`,
@@ -4005,7 +4051,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
     );
 }
 
-/// `/tasks` is registered by a plugin, and the host must not shadow it with a
+/// `/subtasks` is registered by a plugin, and the host must not shadow it with a
 /// builtin of its own: a hardcoded arm ahead of the plugin lookup silently
 /// routed the command to a picker that no longer exists.
 #[test]
@@ -4015,8 +4061,8 @@ fn run_cmdline_reaches_plugin_command_the_host_also_names() {
         dir.clone(),
         Arc::new(test_writer(dir)),
         LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/tasks".into(),
-            description: "Browse and search tasks".into(),
+            name: "/subtasks".into(),
+            description: "Browse and search subtasks".into(),
             plugin: "subtask".into(),
             max_args: 0,
             hidden: false,
@@ -4025,11 +4071,11 @@ fn run_cmdline_reaches_plugin_command_the_host_also_names() {
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    app.run_cmdline("/tasks", 0).unwrap();
+    app.run_cmdline("/subtasks", 0).unwrap();
 
     assert_eq!(
         probe.try_recv_command().map(|(name, _, _)| name),
-        Some("/tasks".to_string())
+        Some("/subtasks".to_string())
     );
 }
 
@@ -5329,6 +5375,216 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
     });
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert!(!app.shell.active_ids().contains(&id));
+}
+
+const USER_TOOL_PROBE: &str = "ut_probe";
+
+fn register_user_tool_probe() {
+    use maki_agent::tools::test_support::mock_tool_with_schema;
+    use maki_agent::tools::{ToolAudience, ToolRegistry, ToolSource};
+
+    let _ = ToolRegistry::global().register(
+        mock_tool_with_schema(
+            USER_TOOL_PROBE,
+            ToolAudience::MAIN,
+            serde_json::json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"}
+                }
+            }),
+        ),
+        ToolSource::Lua {
+            plugin: USER_TOOL_PROBE.into(),
+        },
+    );
+}
+
+#[test_case("$" ; "sigil_only")]
+#[test_case("$100 dollars" ; "prose")]
+#[test_case("not $read at start" ; "mid_line")]
+fn user_tool_prefix_text_stays_a_chat_message(text: &str) {
+    let mut app = test_app();
+    let actions = app.handle_submit(Submission {
+        text: text.to_owned(),
+        images: vec![],
+    });
+    assert!(
+        matches!(actions.into_iter().next(), Some(Action::SendMessage(_))),
+        "non-tool text must reach the agent"
+    );
+}
+
+#[test_case("$ut_probe src/main.rs", true ; "visible")]
+#[test_case("$$ut_probe src/main.rs", false ; "hidden")]
+fn user_tool_prefix_dispatches_registered_tool(text: &str, visible: bool) {
+    register_user_tool_probe();
+    let mut app = test_app();
+    let actions = app.handle_submit(Submission {
+        text: text.to_owned(),
+        images: vec![],
+    });
+    let Some(Action::UserToolCommand {
+        name,
+        input,
+        visible: sent_visible,
+        ..
+    }) = actions.into_iter().next()
+    else {
+        panic!("$tool must dispatch a user tool call");
+    };
+    assert_eq!(name, USER_TOOL_PROBE);
+    assert_eq!(input, serde_json::json!({"path": "src/main.rs"}));
+    assert_eq!(sent_visible, visible);
+}
+
+#[test]
+fn user_tool_unknown_name_flashes() {
+    let mut app = test_app();
+    let actions = app.handle_submit(Submission {
+        text: "$ut_never_registered x".to_owned(),
+        images: vec![],
+    });
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn user_tool_events_render_and_release() {
+    let mut app = test_app();
+    let id = app.shell.reserve_id();
+
+    app.handle_user_tool_event(user_tool::UserToolEvent::Start {
+        id: id.clone(),
+        name: USER_TOOL_PROBE.into(),
+        summary: "src/main.rs".into(),
+        input: "{}".into(),
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 1);
+
+    app.handle_user_tool_event(user_tool::UserToolEvent::Done {
+        id: id.clone(),
+        name: USER_TOOL_PROBE.into(),
+        display: "$ ut_probe src/main.rs".into(),
+        output: "ok".into(),
+        is_error: false,
+        visible: true,
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert!(!app.shell.active_ids().contains(&id));
+    assert_eq!(app.shell.drain_results().len(), 1);
+}
+
+#[test]
+fn dollar_opens_tool_palette_and_tab_completes() {
+    register_user_tool_probe();
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    assert!(app.tool_palette.is_active(), "bare $ lists the tools");
+
+    for ch in "ut_pr".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(ch))));
+    }
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), "$ut_probe ");
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(
+        actions.into_iter().next(),
+        Some(Action::UserToolCommand { name, .. }) if name == USER_TOOL_PROBE
+    ));
+}
+
+#[test]
+fn enter_on_empty_param_list_submits_and_closes_the_helper() {
+    register_user_tool_probe();
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    for ch in "ut_probe ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(ch))));
+    }
+    assert!(
+        app.tool_palette.is_active(),
+        "space after a tool lists its params"
+    );
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(
+        actions.into_iter().next(),
+        Some(Action::UserToolCommand { name, .. }) if name == USER_TOOL_PROBE
+    ));
+    assert!(
+        !app.tool_palette.is_active(),
+        "the submit emptied the buffer, the helper must not outlive it"
+    );
+}
+
+#[test]
+fn ctrl_c_discard_closes_the_tool_helper() {
+    register_user_tool_probe();
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    for ch in "ut_probe ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(ch))));
+    }
+    assert!(app.tool_palette.is_active());
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(!app.tool_palette.is_active());
+    assert!(app.input_box.is_empty(), "ctrl+c discards the draft");
+}
+
+#[test]
+fn tool_palette_esc_closes_without_touching_input() {
+    register_user_tool_probe();
+    let mut app = test_app();
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    assert!(app.tool_palette.is_active());
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.tool_palette.is_active());
+    assert_eq!(app.input_box.buffer.value(), "$");
+}
+
+#[test]
+fn tool_palette_completes_argument_names() {
+    register_user_tool_probe();
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    for ch in "ut_probe ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(ch))));
+    }
+    assert!(
+        app.tool_palette.is_active(),
+        "space after a tool lists its params"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert!(
+        app.input_box.buffer.value().starts_with("$ut_probe "),
+        "params complete after the prefix"
+    );
+    assert!(app.input_box.buffer.value().ends_with('='));
+}
+
+#[test]
+fn tool_prefix_overrides_mode() {
+    let mut app = test_app();
+
+    app.input_box.set_input("$ read".into());
+    assert_eq!(&*app.mode_label().0, "[TOOL]");
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(
+        app.state.mode,
+        Mode::Build,
+        "tab must not toggle while tool prefix present"
+    );
 }
 
 #[test]

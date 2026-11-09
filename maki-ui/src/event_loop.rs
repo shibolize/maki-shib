@@ -58,6 +58,7 @@ use crate::agent::{
 };
 use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
+use crate::app::user_tool::{UserToolEvent, spawn_user_tool};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
@@ -354,6 +355,8 @@ struct SessionRuntime {
     handles: AgentHandles,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
+    user_tool_tx: flume::Sender<UserToolEvent>,
+    user_tool_rx: flume::Receiver<UserToolEvent>,
     last_status: SessionStatus,
     /// Keyed by task id, never by position: a session reset reuses positions,
     /// so a new task would inherit the old one's status.
@@ -469,11 +472,14 @@ impl SpawnCtx {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        let (user_tool_tx, user_tool_rx) = flume::unbounded::<UserToolEvent>();
         SessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
+            user_tool_tx,
+            user_tool_rx,
             last_status: SessionStatus::Idle,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
@@ -521,6 +527,7 @@ enum Wake {
     PluginWindow,
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
+    UserTool(usize, UserToolEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
     ModelsDiscovered,
@@ -881,6 +888,9 @@ impl<'t> EventLoop<'t> {
             sel = sel.recv(&rt.shell_rx, move |res| {
                 res.ok().map(|ev| Wake::Shell(i, ev))
             });
+            sel = sel.recv(&rt.user_tool_rx, move |res| {
+                res.ok().map(|ev| Wake::UserTool(i, ev))
+            });
         }
         sel.wait_timeout(timeout).ok().flatten()
     }
@@ -905,6 +915,7 @@ impl<'t> EventLoop<'t> {
             Wake::PluginWindow => {}
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
+            Wake::UserTool(i, event) => self.sessions[i].app.handle_user_tool_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
             Wake::ModelsDiscovered => self.rebuild_models(),
@@ -1080,6 +1091,14 @@ impl<'t> EventLoop<'t> {
         match action {
             UiAction::Flash(msg) => {
                 self.focused_app().flash(msg);
+            }
+            UiAction::Copy { text, reply_tx } => {
+                let reply = match self.focused_app().clipboard.copy_text(&text) {
+                    Ok(crate::clipboard::CopyResult::Copied) => Ok(()),
+                    Ok(crate::clipboard::CopyResult::Noop) => Err("nothing to copy".to_owned()),
+                    Err(e) => Err(e),
+                };
+                let _ = reply_tx.send(reply);
             }
             UiAction::OpenEditor { path, reply_tx } => {
                 let code = self.open_editor(self.focused, &path);
@@ -1476,6 +1495,7 @@ impl<'t> EventLoop<'t> {
     fn handle_input_request(&mut self, req: InputRequest) -> UiReply {
         match req {
             InputRequest::Read => Ok(self.focused_app().input_snapshot()),
+            InputRequest::History => Ok(self.focused_app().input_history()),
             InputRequest::Edit(edit) => {
                 let area = self.terminal.size().map(Rect::from).unwrap_or_default();
                 self.focused_app().apply_input_edit(edit, area)
@@ -1883,6 +1903,15 @@ impl<'t> EventLoop<'t> {
                     cancel,
                     self.ctx.config.clone(),
                 );
+            }
+            Action::UserToolCommand {
+                id,
+                name,
+                input,
+                visible,
+            } => {
+                let rt = &mut self.sessions[idx];
+                spawn_user_tool(name, input, id, visible, rt.user_tool_tx.clone());
             }
             Action::OpenEditor(path) => {
                 self.open_editor(idx, &path);

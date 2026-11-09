@@ -7,14 +7,14 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 28 built-in tools in this reference (27 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
 ### `bash` {#bash}
 
 Execute a non-interactive bash command. Runs in <cwd> by default; set workdir instead of cd. Join dependent commands with &&. Use tail=N instead of piping to tail, so live output is kept. Output is capped at 2000 lines or 50KB by default. Do not use shell output to talk to the user.
-Output above 398B is compressed before it reaches you: `line [xN]` stands for N lines that differed only in volatile values (timestamps, uuids, epoch runs, temp paths); a run of uniform JSON objects becomes a `<rec cols>` header and TSV rows; a random-looking run of 48+ chars (base64/hex tokens, PEM bodies, digests) becomes `[masked r=<hash> n=<len>]`; spans repeated across lines (a shared path or log prefix) move into a lead legend referenced as `<n>`. Paths, versions, error codes, short numbers and code-looking lines (indented, or ending `;`/`{`/`}`) stay verbatim.
+Output above 398B is compressed before it reaches you, and only when that cuts at least a fifth of it: `line [xN]` stands for N lines that differed only in volatile values (clock timestamps, uuids, epoch values, temp paths); a run of uniform JSON objects becomes a `<rec cols>` header and TSV rows; a random-looking run of 160+ chars (base64/hex bodies, keys, tokens) becomes `[masked n=<len>]`; spans repeated across lines (a shared path or log prefix) move into a lead legend referenced as `<n>`. Paths, identifiers, digests, versions, error codes, counters and code-looking lines (indented, or ending `;`/`{`/`}`) stay verbatim.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -34,7 +34,7 @@ List one directory: names sorted alphabetically, directories first with a traili
 
 ### `read` {#read}
 
-Read a file range with 1-based line numbers: path, offset (first line), and limit (line count; 0 reads to EOF, capped at 2000 lines by default). Absolute, relative, and ~/ paths are accepted. Follow truncation hints to continue.
+Read a file range with 1-based line numbers: path, offset (first line), and limit (line count; 0 reads to EOF, capped at 2000 lines by default). Absolute, relative, and ~/ paths are accepted; draft:<path> reads a draft you fenced earlier. Follow truncation hints to continue.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -44,17 +44,17 @@ Read a file range with 1-based line numbers: path, offset (first line), and limi
 
 ### `write` {#write}
 
-Create a new file with content; creates parent directories. Overwrites an existing file unless append=true.
+Create a new file with content; creates parent directories. Overwrites an existing file unless append=true. Omit content to write the draft you fenced with this path earlier (```lang <path>).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `append` | boolean | no | Add content to the end of the file instead of replacing it |
-| `content` | string | yes | Complete content for a new file; when append=true, only the text to add |
+| `content` | string | no | Complete content for a new file; when append=true, only the text to add. Omit to use the draft fenced with this path |
 | `path` | string | yes | Absolute path to the file |
 
 ### `edit` {#edit}
 
-Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace, with enough context to match once; replace_all=true replaces every occurrence. An empty new_string deletes. If matching fails, re-read the target range and retry once.
+Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace, with enough context to match once; replace_all=true replaces every occurrence. An empty new_string deletes. If matching fails, re-read the target range and retry once. A draft:<path> edits a draft you fenced earlier, before it is written.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -237,7 +237,7 @@ Track work of 3+ steps. Every call replaces the whole list, so include every ite
 
 ### `memory` {#memory}
 
-Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. Update or delete stale facts. list/read return the notes directory; use edit on <dir>/<path> for targeted updates.
+Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. Update or delete stale facts. list/read return the notes directory; use edit on <dir>/<path> for targeted updates. With global memory on, list and read-by-tags join every project's notes (prefixed <project>/); path-based read/write/delete stay in the current project.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -245,6 +245,32 @@ Save and retrieve concise project facts across sessions. Reuse relevant tags fro
 | `content` | string | no | Body for write (frontmatter added automatically). |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
+
+### `transcript` {#transcript}
+
+Your own earlier output: search it, preview what a ⟦first…last⟧ quote pastes, or list drafts and clips. search: regex over everything you wrote, newest first, each hit tagged with where it is. copy: resolve a quote and show the text; with name, save it so ⟦@name⟧ pastes it later. list: drafts (draft:<path>) and clips (@name).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `command` | string | yes |  | search: pattern (regex), optional limit. copy: quote, optional name. list: no arguments |
+| `limit` | integer | no | 20 | Most hits to return |
+| `name` | string | no |  | Save the copied text as a clip pasted with ⟦@name⟧ |
+| `pattern` | string | no |  | Regex matched against each line you wrote |
+| `quote` | string | no |  | A ⟦first…last⟧ or ⟦@name⟧ quote, literal text allowed around it |
+
+### `custom_tools` {#custom_tools}
+
+Persist helper tools across sessions: scripts (bash, python) or small projects in any language, built wherever you like inside the project with write/edit, then registered here so later sessions can find and run them from bash. When you are about to write a script for a task you may face again (project-specific build/test/search/git chores), build it in the project, register it once, and reuse it instead of reinventing it. Before writing a new helper, `list` existing ones to avoid duplicates; `info` shows metadata and help without the source; `read` returns the source. A file tool must run from bash, support `--help`, and document its arguments. A command tool is defined by its `body` and needs no project file. Register one only when it saves tokens and will be reused in later sessions or more than three times in this session; do not build tools for their own sake. list: optional tags, query, and group_by='tag'; returns one row per tool by default. info: path, tags, or query; returns description, tags, and help or the command body without the source. read: path or tags; returns source or command body. write: registers an existing project file (path relative to the project root); omitted tags are derived from the path and an omitted description from the leading comment; it verifies `--help` and warns on failure. Pass `body` to define a command tool instead: the body is a shell command and no project file is required. Re-registering updates tags/description/body without re-sending the file. delete: unregisters; the file stays. Edit a registered tool directly with write/edit; re-register only to change tags or description.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `body` | string | no | write: shell command defining a command tool; no project file is required. Omit to keep an existing body or register a file. |
+| `command` | string | yes | Action name only: list, read, info, write, or delete. Pass arguments in separate fields. list: optional tags, query, and group_by; one row per tool by default. read: tags (all matching sources) or path (one tool); tags win. info: path, tags, or query; metadata and help or the command body without the source. write: registers an existing project file, defines a command tool when body is set, or updates its tags/description/body. delete: unregisters; the file stays. |
+| `description` | string | no | One-line summary of what the tool does and when to use it. Optional on first write: derived from the file's leading comment when omitted. |
+| `group_by` | string | no | list: 'tool' (default) shows one row per tool; 'tag' groups rows under tag sections. |
+| `path` | string | no | Path relative to the project root, e.g. 'scripts/commit-helper.sh'. |
+| `query` | string | no | list/info: case-insensitive substring filter over path, description, and tags. |
+| `tags` | array | no | snake_case categories. Filter for list/read/info; derived from the path when omitted on write. |
 
 ### `skill` {#skill}
 

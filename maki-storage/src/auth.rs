@@ -81,18 +81,17 @@ impl ProviderCredentials {
 /// thread too, so a lock that does not arrive in time is given up and the
 /// caller carries on as before.
 pub fn lock_exclusive(path: &Path) -> Option<File> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => {
-            fs::create_dir_all(path.parent()?).ok()?;
-            OpenOptions::new()
-                .write(true)
-                .truncate(false)
-                .create(true)
-                .open(path)
-                .ok()?
-        }
-    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok()?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .create(true)
+        .open(path)
+        .or_else(|_| File::open(path))
+        .ok()?;
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
         match file.try_lock() {
@@ -166,6 +165,7 @@ pub fn load_mcp_auth(dir: &StateDir, server_name: &str, expected_url: &str) -> O
         return None;
     }
     if let Some(expires_at) = data.client_secret_expires_at
+        && expires_at > 0
         && now_millis() / 1000 >= expires_at
     {
         return None;
@@ -295,7 +295,8 @@ mod tests {
 
     #[test_case(
         test_mcp_data(),
-        "https://other.example.com"
+        "https://other.example.com",
+        false
         ; "url_mismatch"
     )]
     #[test_case(
@@ -304,13 +305,38 @@ mod tests {
             client_secret_expires_at: Some(1),
             ..test_mcp_data()
         },
-        TEST_URL
+        TEST_URL,
+        false
         ; "expired_client_secret"
     )]
-    fn mcp_auth_load_returns_none(data: McpAuthData, lookup_url: &str) {
+    #[test_case(
+        McpAuthData {
+            client_secret: Some("s".into()),
+            client_secret_expires_at: Some(0),
+            ..test_mcp_data()
+        },
+        TEST_URL,
+        true
+        ; "zero_expiry_means_non_expiring"
+    )]
+    fn mcp_auth_load_check(data: McpAuthData, lookup_url: &str, expected_some: bool) {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         save_mcp_auth(&dir, "srv", &data).unwrap();
-        assert!(load_mcp_auth(&dir, "srv", lookup_url).is_none());
+        assert_eq!(
+            load_mcp_auth(&dir, "srv", lookup_url).is_some(),
+            expected_some
+        );
+    }
+
+    #[test_case("openai" ; "reacquire_existing_lock_file")]
+    fn lock_tokens_sequential(provider: &str) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let first = lock_tokens(&dir, provider);
+        assert!(first.is_some());
+        drop(first);
+        let second = lock_tokens(&dir, provider);
+        assert!(second.is_some());
     }
 }

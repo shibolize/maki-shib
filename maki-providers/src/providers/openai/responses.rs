@@ -187,9 +187,15 @@ pub(crate) async fn do_stream(
     if summary_rejected(base) && has_summary(&body) {
         strip_summary(body.to_mut());
     }
-    let result = post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await;
+    let body_ref = &*body;
+    let (result, forwarded) = super::super::run_stream_attempt(event_tx, |tx| async move {
+        post_responses(client, model, body_ref, &tx, auth, base, stream_timeout).await
+    })
+    .await;
     match result {
-        Err(err) if has_summary(&body) && err.is_unsupported_reasoning_summary() => {
+        Err(err)
+            if forwarded == 0 && has_summary(&body) && err.is_unsupported_reasoning_summary() =>
+        {
             reject_summary(base);
             strip_summary(body.to_mut());
             post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await

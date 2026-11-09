@@ -156,18 +156,33 @@ impl ProviderData {
         Some(creds.api_key)
     }
 
-    pub fn resolve_api_key(&self, state_dir: &StateDir) -> Option<String> {
+    pub fn resolve_key_pool(&self, state_dir: &StateDir) -> Option<super::KeyPool> {
         for var in &self.env_keys {
-            if let Ok(val) = std::env::var(var) {
+            if let Ok(pool) = super::KeyPool::from_env(var) {
                 debug!(provider = %self.display_name, var = %var, "api key resolved from env");
-                return Some(val);
+                return Some(pool);
             }
         }
         if let Some(key) = self.load_key_from_storage(state_dir) {
             debug!(provider = %self.display_name, "api key resolved from storage");
-            return Some(key);
+            return Some(super::KeyPool::from_keys(vec![key]));
+        }
+        if let Some(key) = super::KeyPool::key_from_config(&self.slug) {
+            debug!(provider = %self.display_name, "api key resolved from providers.toml");
+            return Some(super::KeyPool::from_keys(vec![key]));
         }
         None
+    }
+
+    pub fn resolve_api_key(&self, state_dir: &StateDir) -> Option<String> {
+        self.resolve_key_pool(state_dir).map(|p| p.current())
+    }
+
+    fn key_header(&self) -> super::KeyHeader {
+        match self.npm.as_str() {
+            "@ai-sdk/anthropic" => super::KeyHeader::Raw("x-api-key"),
+            _ => super::KeyHeader::Bearer,
+        }
     }
 
     pub fn env_key_set(&self) -> Option<&str> {
@@ -822,7 +837,11 @@ impl CatalogTransport {
 /// auth that the models.dev catalog would have used for that sub-provider.
 pub struct CatalogProvider {
     data: ProviderData,
-    auth: CatalogAuth,
+    state_dir: StateDir,
+    allow_free_fallback: bool,
+    auth: Mutex<CatalogAuth>,
+    resolved_auth: Mutex<ResolvedAuth>,
+    key_pool: Option<super::KeyPool>,
     transport: CatalogTransport,
 }
 
@@ -847,6 +866,17 @@ impl CatalogAuth {
             ))),
         }
     }
+
+    fn resolved_or_empty(&self) -> ResolvedAuth {
+        match self {
+            Self::Keyed(auth) | Self::FreeOnly(auth) => auth.clone(),
+            Self::Gated(_) => ResolvedAuth {
+                base_url: None,
+                headers: Vec::new(),
+                config_headers: Vec::new(),
+            },
+        }
+    }
 }
 
 impl CatalogProvider {
@@ -856,8 +886,17 @@ impl CatalogProvider {
         timeouts: Timeouts,
         allow_free_fallback: bool,
     ) -> Result<Self, AgentError> {
+        let pool = data
+            .resolve_key_pool(state_dir)
+            .unwrap_or_else(super::KeyPool::empty);
+        let auth = data.catalog_auth(state_dir, allow_free_fallback)?;
+        let resolved = auth.resolved_or_empty();
         Ok(Self {
-            auth: data.catalog_auth(state_dir, allow_free_fallback)?,
+            auth: Mutex::new(auth),
+            resolved_auth: Mutex::new(resolved),
+            key_pool: Some(pool),
+            state_dir: state_dir.clone(),
+            allow_free_fallback,
             data,
             transport: CatalogTransport::new(timeouts)?,
         })
@@ -876,7 +915,15 @@ impl Provider for CatalogProvider {
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.unlocked(&self.data.slug)?.clone();
+            self.auth
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unlocked(&self.data.slug)?;
+            let auth = self
+                .resolved_auth
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let auth = self.data.request_auth(auth, session_id);
             let meta = self
                 .data
@@ -914,11 +961,12 @@ impl Provider for CatalogProvider {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner());
             Ok(self
                 .data
                 .models
                 .iter()
-                .filter(|(_, meta)| match &self.auth {
+                .filter(|(_, meta)| match &*auth {
                     CatalogAuth::Keyed(_) => true,
                     CatalogAuth::FreeOnly(_) => is_free_model(meta),
                     CatalogAuth::Gated(_) => false,
@@ -926,6 +974,29 @@ impl Provider for CatalogProvider {
                 .map(|(model_id, meta)| meta.model_info(model_id))
                 .collect())
         })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            let new_pool = self
+                .data
+                .resolve_key_pool(&self.state_dir)
+                .unwrap_or_else(super::KeyPool::empty);
+            let new_auth = self
+                .data
+                .catalog_auth(&self.state_dir, self.allow_free_fallback)?;
+            let new_resolved = new_auth.resolved_or_empty();
+            if let Some(pool) = &self.key_pool {
+                pool.replace(new_pool);
+            }
+            *self.resolved_auth.lock().unwrap_or_else(|e| e.into_inner()) = new_resolved;
+            *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = new_auth;
+            Ok(())
+        })
+    }
+
+    fn keys(&self) -> Option<super::KeyRotation<'_>> {
+        super::key_rotation(&self.key_pool, &self.resolved_auth, self.data.key_header())
     }
 }
 
@@ -1007,6 +1078,14 @@ impl Provider for LazyCatalogProvider {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move { self.resolve().await?.list_models().await })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async move { self.resolve().await?.reload_auth().await })
+    }
+
+    fn keys(&self) -> Option<super::KeyRotation<'_>> {
+        self.inner.get()?.as_ref().ok()?.keys()
     }
 }
 

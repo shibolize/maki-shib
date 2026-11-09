@@ -115,9 +115,11 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "cd",
     "code_execution",
     "create_plugin",
+    "custom_tools",
     "edit",
     "glob",
     "grep",
+    "input_history",
     "list",
     "memory",
     "outline",
@@ -131,6 +133,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "thinking",
     "todo_write",
     "tool_help",
+    "transcript",
     "view_image",
     "webfetch",
     "websearch",
@@ -264,8 +267,22 @@ pub fn expand_env(value: &str) -> Result<String, String> {
 }
 
 pub static LOG_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The session this process is writing. Wire logs key their file on it, so
+/// `None` means nothing is logged. Published by every run front end, not just
+/// the TUI, since `-p`, SDK, and ACP runs log requests too.
 pub static CURRENT_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Display name for the session's wire log symlink. Cosmetic: the `.mlog`
+/// itself is keyed by [`CURRENT_SESSION_ID`].
 pub static CURRENT_SESSION_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Publish the running session for wire logging. Last writer wins; call it
+/// before the first request of the run.
+pub fn set_current_session(id: &str, name: &str) {
+    *CURRENT_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_owned());
+    *CURRENT_SESSION_NAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(name.to_owned());
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
@@ -1529,7 +1546,7 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
-        desc = "Compress large bash tool output and long user input with rstring before it enters the context: lines differing only in volatile values (timestamps, ids) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows, random-looking byte runs of 48+ chars are masked inline to `[masked r=<hash> n=<len>]`; code-looking lines (indented, or ending `;`/`{`/`}`) pass through verbatim, never merged or masked"
+        desc = "Compress large bash tool output and long user input with rstring before it enters the context, only when that cuts at least 256 bytes and a fifth of the text: lines differing only in volatile values (clock timestamps, uuids, epoch values, temp paths) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows, random-looking runs of 160+ chars (base64/hex bodies, not paths or identifiers) become `[masked n=<len>]`; code-looking lines (indented, or ending `;`/`{`/`}`) pass through verbatim, never merged or masked"
     )]
     pub rstring: bool,
 

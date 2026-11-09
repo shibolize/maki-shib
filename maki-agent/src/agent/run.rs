@@ -920,7 +920,7 @@ impl<'h> Agent<'h> {
         .await
         {
             Ok(_) => {
-                self.provider.refresh_auth().await?;
+                self.provider.reload_auth().await?;
                 Ok(TurnOutcome::Continue)
             }
             Err(_) => Err(AgentError::Cancelled),
@@ -1059,6 +1059,7 @@ impl<'h> Agent<'h> {
             model_policy: Arc::clone(&self.model_policy),
             tool_filter: Arc::clone(self.tools.filter()),
             ledger: Arc::clone(&self.ledger),
+            transcript: self.history.transcript(),
         }
     }
 

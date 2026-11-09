@@ -229,32 +229,10 @@ fn parse_container_credentials_response(
     Ok((access_key, secret_key, session_token, expires_at))
 }
 
-// Hand-rolled to avoid pulling in chrono just for this one field.
 fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
-    let s = s.strip_suffix('Z')?;
-    let (date, time) = s.split_once('T')?;
-    let mut date_parts = date.split('-');
-    let year: u64 = date_parts.next()?.parse().ok()?;
-    let month: u64 = date_parts.next()?.parse().ok()?;
-    let day: u64 = date_parts.next()?.parse().ok()?;
-    let time = time.split('.').next()?; // drop fractional seconds
-    let mut time_parts = time.split(':');
-    let hour: u64 = time_parts.next()?.parse().ok()?;
-    let minute: u64 = time_parts.next()?.parse().ok()?;
-    let second: u64 = time_parts.next()?.parse().ok()?;
-    Some(ymdhms_to_epoch(year, month, day, hour, minute, second))
-}
-
-// Inverse of days_to_ymd. Howard Hinnant's algorithm; valid for any civil date.
-fn ymdhms_to_epoch(year: u64, month: u64, day: u64, hour: u64, minute: u64, second: u64) -> u64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let m = month as i64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
-    let doe = yoe as i64 * 365 + (yoe / 4) as i64 - (yoe / 100) as i64 + doy;
-    let days_since_epoch = (era as i64 * 146097 + doe - 719468) as u64;
-    days_since_epoch * 86400 + hour * 3600 + minute * 60 + second
+    s.parse::<jiff::Timestamp>()
+        .ok()
+        .and_then(|ts| u64::try_from(ts.as_second()).ok())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -712,7 +690,7 @@ impl Provider for Bedrock {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let new_auth = resolve_bedrock_auth()?;
+            let new_auth = smol::unblock(resolve_bedrock_auth).await?;
             *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = new_auth;
             debug!("reloaded Bedrock auth from env");
             Ok(())
@@ -983,15 +961,17 @@ aws_session_token = MYTOKEN\n";
         assert!(parse_container_credentials_response(body).is_err());
     }
 
-    #[test_case("2026-05-11T18:00:00Z",      Some(1778522400) ; "plain_seconds")]
-    #[test_case("2026-05-11T18:00:00.123Z",  Some(1778522400) ; "fractional_dropped")]
-    #[test_case("2024-01-01T00:00:00Z",      Some(1704067200) ; "epoch_2024")]
-    #[test_case("1970-01-01T00:00:00Z",      Some(0)          ; "unix_epoch")]
-    #[test_case("2000-02-29T23:59:59Z",      Some(951868799)  ; "leap_day")]
-    #[test_case("2024-12-31T23:59:59Z",      Some(1735689599) ; "year_end")]
-    #[test_case("2100-03-01T00:00:00Z",      Some(4107542400) ; "century_non_leap")]
-    #[test_case("not a date",                None              ; "garbage")]
-    #[test_case("2026-05-11T18:00:00",       None              ; "missing_z")]
+    #[test_case("2026-05-11T18:00:00Z",       Some(1778522400) ; "plain_seconds")]
+    #[test_case("2026-05-11T18:00:00.123Z",   Some(1778522400) ; "fractional_dropped")]
+    #[test_case("2026-05-11T18:00:00+00:00",  Some(1778522400) ; "utc_offset_colon")]
+    #[test_case("2026-05-11T20:00:00+02:00",  Some(1778522400) ; "positive_offset")]
+    #[test_case("2024-01-01T00:00:00Z",       Some(1704067200) ; "epoch_2024")]
+    #[test_case("1970-01-01T00:00:00Z",       Some(0)          ; "unix_epoch")]
+    #[test_case("2000-02-29T23:59:59Z",       Some(951868799)  ; "leap_day")]
+    #[test_case("2024-12-31T23:59:59Z",       Some(1735689599) ; "year_end")]
+    #[test_case("2100-03-01T00:00:00Z",       Some(4107542400) ; "century_non_leap")]
+    #[test_case("not a date",                 None             ; "garbage")]
+    #[test_case("2026-05-11T18:00:00",        None             ; "missing_z")]
     fn iso8601_parse(input: &str, expected: Option<u64>) {
         assert_eq!(parse_iso8601_to_epoch(input), expected);
     }

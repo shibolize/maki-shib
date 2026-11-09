@@ -345,7 +345,7 @@ impl Anthropic {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
         let resolved_base_url = resolve_anthropic_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
+        let resolved = resolve_auth_from_key(&pool.current(), resolved_base_url.clone())?;
         debug!(keys = pool.len(), "using API key authentication");
         Ok(Self {
             client: super::http_client(timeouts)?,
@@ -520,9 +520,14 @@ impl Provider for Anthropic {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
+            let Some(pool) = &self.key_pool else {
+                return Ok(());
+            };
+            let new_pool = KeyPool::resolve("anthropic", ENV_VAR)?;
+            let key = new_pool.current();
+            pool.replace(new_pool);
             *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
+                resolve_auth_from_key(&key, self.resolved_base_url.clone())?;
             debug!("reloaded Anthropic auth from env");
             Ok(())
         })

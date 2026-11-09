@@ -10,7 +10,10 @@ use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai::responses;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::providers::{ResolvedAuth, refreshed_tokens};
+use crate::providers::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, key_rotation, refreshed_tokens,
+    run_stream_attempt,
+};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, dialect,
 };
@@ -31,6 +34,7 @@ const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
 pub struct Xai {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
+    key_pool: Option<KeyPool>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
 }
@@ -38,10 +42,11 @@ pub struct Xai {
 impl Xai {
     pub fn new(timeouts: crate::providers::Timeouts) -> Result<Self, AgentError> {
         let storage = StateDir::resolve()?;
-        let resolved = auth::resolve(&storage)?;
+        let (resolved, pool) = auth::resolve_with_pool(&storage)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth: Arc::new(Mutex::new(resolved)),
+            key_pool: Some(pool),
             storage: Some(storage),
             system_prefix: None,
         })
@@ -54,6 +59,7 @@ impl Xai {
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth,
+            key_pool: None,
             storage: None,
             system_prefix: None,
         })
@@ -115,6 +121,26 @@ impl Xai {
             && self.refresh_oauth().await.is_ok()
         {
             return f().await;
+        }
+        result
+    }
+
+    async fn stream_with_oauth_retry<F, Fut>(
+        &self,
+        event_tx: &Sender<ProviderEvent>,
+        f: F,
+    ) -> Result<StreamResponse, AgentError>
+    where
+        F: Fn(Sender<ProviderEvent>) -> Fut,
+        Fut: std::future::Future<Output = Result<StreamResponse, AgentError>>,
+    {
+        let (result, forwarded) = run_stream_attempt(event_tx, &f).await;
+        if forwarded == 0
+            && self.is_oauth()
+            && matches!(&result, Err(e) if e.is_auth_error())
+            && self.refresh_oauth().await.is_ok()
+        {
+            return f(event_tx.clone()).await;
         }
         result
     }
@@ -180,16 +206,17 @@ impl Provider for Xai {
                     body["prompt_cache_key"] = json!(session.as_str());
                 }
                 let stream_timeout = self.compat.stream_timeout();
+                let body = &body;
                 return self
-                    .with_oauth_retry(|| async {
+                    .stream_with_oauth_retry(event_tx, |tx| async move {
                         let mut auth = self.current_auth();
                         auth.headers
                             .extend(proxy_request_headers(model, session_id));
                         responses::do_stream(
                             self.compat.client(),
                             model,
-                            &body,
-                            event_tx,
+                            body,
+                            &tx,
                             &auth,
                             stream_timeout,
                         )
@@ -201,11 +228,10 @@ impl Provider for Xai {
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
                 .apply_reasoning_effort(&mut body, &dialect::GROK, model);
-            self.with_oauth_retry(|| async {
+            let body = &body;
+            self.stream_with_oauth_retry(event_tx, |tx| async move {
                 let auth = self.current_auth();
-                self.compat
-                    .do_stream(model, &[], &body, event_tx, &auth)
-                    .await
+                self.compat.do_stream(model, &[], body, &tx, &auth).await
             })
             .await
         })
@@ -251,11 +277,19 @@ impl Provider for Xai {
             let Some(storage) = self.storage.clone() else {
                 return Ok(());
             };
-            let resolved = smol::unblock(move || auth::resolve(&storage)).await?;
+            let (resolved, new_pool) =
+                smol::unblock(move || auth::resolve_with_pool(&storage)).await?;
+            if let Some(pool) = &self.key_pool {
+                pool.replace(new_pool);
+            }
             *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = resolved;
             debug!("reloaded xAI auth from storage");
             Ok(())
         })
+    }
+
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        key_rotation(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 
     fn adjust_model(&self, model: &mut Model) {

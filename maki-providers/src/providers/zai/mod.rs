@@ -19,7 +19,9 @@ use crate::{
     dialect,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation, reload_key_pool,
+};
 
 const SLUG: &str = "zai";
 const DISPLAY_NAME: &str = "Z.AI";
@@ -210,7 +212,7 @@ pub struct Zai {
 impl Zai {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("zai", CONFIG_STANDARD.api_key_env)?;
-        let mut auth = ResolvedAuth::bearer("zai", pool.current())?;
+        let mut auth = ResolvedAuth::bearer("zai", &pool.current())?;
         let provider_config = maki_config::providers::ProvidersConfig::load();
         if let Some(url) =
             maki_config::providers::resolve_base_url("zai", provider_config.get("zai"))
@@ -291,6 +293,18 @@ impl Provider for Zai {
             let body = self.compat.get_text(&auth, QUOTA_LIMIT_URL).await?;
             let parsed: QuotaResponse = serde_json::from_str(&body)?;
             Ok(Some(parsed.into()))
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            reload_key_pool(
+                CONFIG_STANDARD.slug,
+                CONFIG_STANDARD.api_key_env,
+                &self.key_pool,
+                &self.auth,
+                KeyHeader::Bearer,
+            )
         })
     }
 
