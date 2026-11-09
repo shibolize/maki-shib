@@ -1,5 +1,5 @@
 use std::time::Duration;
-use std::{env, thread};
+use std::thread;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -12,7 +12,7 @@ use tracing::{debug, error, warn};
 
 use crate::AgentError;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
-use crate::providers::{ResolvedAuth, refreshed_tokens, urlenc};
+use crate::providers::{KeyPool, ResolvedAuth, refreshed_tokens, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const PROVIDER: &str = super::SLUG;
@@ -49,7 +49,8 @@ struct DeviceTokenResponse {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
-    refresh_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
     #[serde(default)]
     id_token: Option<String>,
     expires_in: Option<u64>,
@@ -230,15 +231,26 @@ fn authorization_url(redirect_uri: &str, challenge: &str, state: &str) -> String
     )
 }
 
-fn into_oauth_tokens(resp: TokenResponse) -> OAuthTokens {
-    let account_id = extract_account_id_from_tokens(&resp);
+fn into_oauth_tokens(
+    resp: TokenResponse,
+    fallback_refresh: Option<String>,
+    fallback_account_id: Option<String>,
+) -> Result<OAuthTokens, AgentError> {
+    let account_id = extract_account_id_from_tokens(&resp).or(fallback_account_id);
+    let refresh = resp
+        .refresh_token
+        .filter(|s| !s.is_empty())
+        .or(fallback_refresh)
+        .ok_or_else(|| AgentError::Config {
+            message: "OpenAI token response did not include a refresh token".into(),
+        })?;
     let expires = now_millis() + resp.expires_in.unwrap_or(3600) * 1000;
-    OAuthTokens {
+    Ok(OAuthTokens {
         access: resp.access_token,
-        refresh: resp.refresh_token,
+        refresh,
         expires,
         account_id,
-    }
+    })
 }
 
 pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
@@ -271,37 +283,37 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
 
     let body_text = resp.text()?;
     let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
-    Ok(into_oauth_tokens(token_resp))
+    into_oauth_tokens(
+        token_resp,
+        Some(tokens.refresh.clone()),
+        tokens.account_id.clone(),
+    )
 }
 
 pub(crate) const CODING_PLAN_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> Result<ResolvedAuth, AgentError> {
-    ResolvedAuth::bearer(PROVIDER, &tokens.access)
-}
-
-pub(crate) fn build_coding_plan_resolved(tokens: &OAuthTokens) -> Result<ResolvedAuth, AgentError> {
     let mut headers = vec![("authorization".into(), format!("Bearer {}", tokens.access))];
     if let Some(account_id) = &tokens.account_id {
         headers.push(("chatgpt-account-id".into(), account_id.clone()));
     }
-    Ok(ResolvedAuth::new(PROVIDER, headers)?.with_base_url(Some(CODING_PLAN_BASE_URL.into())))
+    ResolvedAuth::new(PROVIDER, headers)
 }
 
 pub(crate) fn is_oauth(dir: &StateDir) -> bool {
     load_tokens(dir, PROVIDER).is_some()
 }
 
-pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
+pub(crate) fn resolve_with_pool(dir: &StateDir) -> Result<(ResolvedAuth, KeyPool), AgentError> {
     if let Some(tokens) = load_tokens(dir, PROVIDER) {
         if !tokens.is_expired() {
             debug!("using OpenAI OAuth authentication");
-            return build_oauth_resolved(&tokens);
+            return Ok((build_oauth_resolved(&tokens)?, KeyPool::empty()));
         }
         match refreshed_tokens(dir, PROVIDER, None, refresh_tokens) {
             Ok(fresh) => {
                 debug!("using OpenAI OAuth authentication (refreshed)");
-                return build_oauth_resolved(&fresh);
+                return Ok((build_oauth_resolved(&fresh)?, KeyPool::empty()));
             }
             Err(e) => {
                 warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
@@ -310,14 +322,9 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
         }
     }
 
-    if let Ok(key) = env::var("OPENAI_API_KEY") {
-        debug!("using OpenAI API key authentication");
-        return ResolvedAuth::bearer(PROVIDER, &key);
-    }
-
-    if let Some(creds) = maki_storage::auth::load_provider_credentials(dir, PROVIDER) {
-        debug!("using OpenAI saved API key");
-        return ResolvedAuth::bearer(PROVIDER, &creds.api_key);
+    if let Ok(pool) = KeyPool::resolve_in(PROVIDER, "OPENAI_API_KEY", Some(dir)) {
+        let auth = ResolvedAuth::bearer(PROVIDER, &pool.current())?;
+        return Ok((auth, pool));
     }
 
     Err(AgentError::Config {
@@ -325,12 +332,16 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
     })
 }
 
+pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
+    resolve_with_pool(dir).map(|(auth, _)| auth)
+}
+
 pub fn login(dir: &StateDir) -> Result<(), AgentError> {
     let token_response = match oauth_loopback::select_login_method(DISPLAY_NAME)? {
         LoginMethod::Browser => browser_login()?,
         LoginMethod::Device => device_login()?,
     };
-    let tokens = into_oauth_tokens(token_response);
+    let tokens = into_oauth_tokens(token_response, None, None)?;
     save_tokens(dir, PROVIDER, &tokens)?;
     println!("Authenticated successfully.");
     Ok(())
@@ -403,6 +414,9 @@ pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
+
+    const MISSING_REFRESH_ERROR: &str = "OpenAI token response did not include a refresh token";
 
     #[test]
     fn extract_account_id_from_jwt() {
@@ -427,5 +441,48 @@ mod tests {
         assert!(url.contains("code_challenge=challenge&code_challenge_method=S256"));
         assert!(url.contains("state=state"));
         assert!(!url.contains("device"));
+    }
+
+    #[test_case(
+        r#"{"access_token":"acc","refresh_token":"new-ref","expires_in":3600}"#,
+        Some("old-ref"),
+        Some("acct-fallback"),
+        Ok(("new-ref", Some("acct-fallback")))
+        ; "uses_response_refresh_and_preserves_fallback_account_id"
+    )]
+    #[test_case(
+        r#"{"access_token":"acc","expires_in":3600}"#,
+        Some("old-ref"),
+        Some("acct-fallback"),
+        Ok(("old-ref", Some("acct-fallback")))
+        ; "omitted_refresh_falls_back_to_existing"
+    )]
+    #[test_case(
+        r#"{"access_token":"acc","expires_in":3600}"#,
+        None,
+        None,
+        Err(MISSING_REFRESH_ERROR)
+        ; "missing_refresh_without_fallback_errors"
+    )]
+    fn into_oauth_tokens_handles_optional_refresh_and_account_id(
+        json: &str,
+        fallback_refresh: Option<&str>,
+        fallback_account: Option<&str>,
+        expected: Result<(&str, Option<&str>), &str>,
+    ) {
+        let resp: TokenResponse = serde_json::from_str(json).unwrap();
+        let result = into_oauth_tokens(
+            resp,
+            fallback_refresh.map(String::from),
+            fallback_account.map(String::from),
+        );
+        match (result, expected) {
+            (Ok(tokens), Ok((exp_ref, exp_acct))) => {
+                assert_eq!(tokens.refresh, exp_ref);
+                assert_eq!(tokens.account_id.as_deref(), exp_acct);
+            }
+            (Err(err), Err(exp_err)) => assert_eq!(err.to_string(), exp_err),
+            (got, exp) => panic!("mismatch: got={got:?}, expected={exp:?}"),
+        }
     }
 }

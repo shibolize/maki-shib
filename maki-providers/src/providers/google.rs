@@ -126,7 +126,7 @@ impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
         let resolved_base_url = resolve_google_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
+        let resolved = resolve_auth_from_key(&pool.current(), resolved_base_url.clone())?;
         Ok(Self {
             client: http_client(timeouts)?,
             auth: Arc::new(Mutex::new(resolved)),
@@ -168,7 +168,7 @@ impl Google {
         let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner());
         auth.headers
             .iter()
-            .find(|(k, _)| k == API_KEY_HEADER)
+            .find(|(k, _)| k.eq_ignore_ascii_case(API_KEY_HEADER))
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     }
@@ -188,7 +188,12 @@ impl Google {
             auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
         };
         let key = self.api_key();
-        format!("{base}/models?key={key}&pageSize=1000")
+        if key.is_empty() {
+            format!("{base}/models?pageSize=1000")
+        } else {
+            let encoded = super::urlenc(&key);
+            format!("{base}/models?key={encoded}&pageSize=1000")
+        }
     }
 
     fn build_body(
@@ -302,9 +307,14 @@ impl Provider for Google {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
+            let Some(pool) = &self.key_pool else {
+                return Ok(());
+            };
+            let new_pool = KeyPool::resolve(SLUG, ENV_VAR)?;
+            let key = new_pool.current();
+            pool.replace(new_pool);
             *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
+                resolve_auth_from_key(&key, self.resolved_base_url.clone())?;
             Ok(())
         })
     }

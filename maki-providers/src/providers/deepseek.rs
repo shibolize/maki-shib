@@ -21,7 +21,9 @@ use crate::{
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation, reload_key_pool,
+};
 
 const PAD: &str = "";
 const REASONER_ID: &str = "deepseek-reasoner";
@@ -168,7 +170,7 @@ impl DeepSeek {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
                 CONFIG.slug,
-                pool.current(),
+                &pool.current(),
             )?)),
             key_pool: Some(pool),
             system_prefix: None,
@@ -240,6 +242,18 @@ impl Provider for DeepSeek {
             let body = self.compat.get_text(&auth, BALANCE_URL).await?;
             let parsed: BalanceResponse = serde_json::from_str(&body)?;
             Ok(Some(parsed.into()))
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            reload_key_pool(
+                CONFIG.slug,
+                CONFIG.api_key_env,
+                &self.key_pool,
+                &self.auth,
+                KeyHeader::Bearer,
+            )
         })
     }
 

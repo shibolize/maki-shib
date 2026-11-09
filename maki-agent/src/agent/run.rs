@@ -920,7 +920,7 @@ impl<'h> Agent<'h> {
         .await
         {
             Ok(_) => {
-                self.provider.refresh_auth().await?;
+                self.provider.reload_auth().await?;
                 Ok(TurnOutcome::Continue)
             }
             Err(_) => Err(AgentError::Cancelled),

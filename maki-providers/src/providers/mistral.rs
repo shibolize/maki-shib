@@ -17,7 +17,9 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, 
 use super::openai_compat::{
     MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body,
 };
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation, reload_key_pool,
+};
 
 const SLUG: &str = "mistral";
 const DISPLAY_NAME: &str = "Mistral";
@@ -163,7 +165,10 @@ impl Mistral {
         let pool = KeyPool::resolve("mistral", CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer("mistral", pool.current())?)),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
+                "mistral",
+                &pool.current(),
+            )?)),
             key_pool: Some(pool),
             system_prefix: None,
         })
@@ -261,6 +266,18 @@ impl Provider for Mistral {
                     })
                 })
                 .await
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            reload_key_pool(
+                CONFIG.slug,
+                CONFIG.api_key_env,
+                &self.key_pool,
+                &self.auth,
+                KeyHeader::Bearer,
+            )
         })
     }
 

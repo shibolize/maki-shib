@@ -28,11 +28,19 @@ const PROVIDERS_TOML_DOCS: &str = "https://maki.sh/docs/providers/";
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
-        Some("openai") => openai_auth::login(storage)?,
-        Some("xai") => xai_auth::login(storage)?,
-        Some("copilot") => copilot_auth::login(storage)?,
-        Some(slug) => {
-            let slug = slugify(slug);
+        Some(slug) => login_by_slug(slug, storage)?,
+        None => login_interactive(storage)?,
+    }
+    Ok(())
+}
+
+fn login_by_slug(slug: &str, storage: &StateDir) -> Result<()> {
+    let slug = slugify(slug);
+    match slug.as_str() {
+        "openai" => openai_auth::login(storage)?,
+        "xai" => xai_auth::login(storage)?,
+        "copilot" => copilot_auth::login(storage)?,
+        _ => {
             if builtin_provider(&slug).is_none()
                 && dynamic::display_name(&slug).is_none()
                 && ProvidersConfig::load().get(&slug).is_none()
@@ -43,7 +51,6 @@ pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
                 login_provider(&slug, storage)?;
             }
         }
-        None => login_interactive(storage)?,
     }
     Ok(())
 }
@@ -175,7 +182,9 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
     println!("  Available providers:");
     println!();
     for (i, b) in builtins.iter().enumerate() {
-        let status = if load_provider_credentials(storage, b.slug).is_some() {
+        let status = if load_provider_credentials(storage, b.slug).is_some()
+            || load_tokens(storage, b.slug).is_some()
+        {
             "\x1b[32m✓\x1b[0m"
         } else if env::var(b.default_api_key_env).is_ok() {
             "\x1b[33m~\x1b[0m"
@@ -231,7 +240,7 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
         login_custom(storage)?;
     } else if choice <= builtins.len() {
         let slug = builtins[choice - 1].slug;
-        login_provider(slug, storage)?;
+        login_by_slug(slug, storage)?;
     } else if choice <= builtins.len() + custom_slugs.len() {
         let slug = custom_slugs[choice - builtins.len() - 1];
         login_provider(slug, storage)?;
@@ -437,7 +446,7 @@ fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Resu
 
 pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
-    match provider {
+    match slug.as_str() {
         "openai" => openai_auth::logout(storage)?,
         "xai" => xai_auth::logout(storage)?,
         "copilot" => copilot_auth::logout(storage)?,
@@ -475,15 +484,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
                 .and_then(|d| d.plan.as_deref())
                 .map(|p| format!(" ({})", p))
                 .unwrap_or_default();
-            let masked = if creds.api_key.len() > 8 {
-                format!(
-                    "{}...{}",
-                    &creds.api_key[..4],
-                    &creds.api_key[creds.api_key.len() - 4..]
-                )
-            } else {
-                "****".to_string()
-            };
+            let masked = creds.masked_api_key();
             println!(
                 "  \x1b[32m✓\x1b[0m {:<14} {} (key: {}){}",
                 b.slug, display, masked, plan_info

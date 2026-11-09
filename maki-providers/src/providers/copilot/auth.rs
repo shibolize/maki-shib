@@ -207,15 +207,17 @@ fn decode_go_keyring(raw: &str) -> String {
 }
 
 pub fn login(dir: &StateDir) -> Result<(), AgentError> {
-    if load_token().is_ok() {
-        println!("Already authenticated with Copilot.");
-        return Ok(());
-    }
-
     let mut hints = Vec::new();
     let creds = match discover_token(&mut hints) {
         Ok(creds) => creds,
         Err(err) => {
+            if TOKEN_ENV_VARS
+                .iter()
+                .any(|key| env::var(key).is_ok_and(|v| !v.trim().is_empty()))
+            {
+                println!("Already authenticated with Copilot.");
+                return Ok(());
+            }
             for hint in hints {
                 eprintln!("{hint}");
             }

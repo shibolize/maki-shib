@@ -95,10 +95,15 @@ pub(super) fn server_origin(server_url: &str) -> String {
 }
 
 fn validate_endpoint_url(url: &str) -> Result<(), OAuthError> {
-    if url.starts_with("https://")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://localhost")
-    {
+    let parts = parse_url(url);
+    let host = parts
+        .authority
+        .split_once(':')
+        .map_or(parts.authority, |(h, _)| h);
+    let is_https = parts.scheme.eq_ignore_ascii_case("https://") && !host.is_empty();
+    let is_loopback_http = parts.scheme.eq_ignore_ascii_case("http://")
+        && (host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1");
+    if is_https || is_loopback_http {
         Ok(())
     } else {
         Err(OAuthError::Other(format!(
@@ -344,10 +349,15 @@ mod tests {
         );
     }
 
-    #[test_case("https://example.com/token",   true  ; "https_valid")]
-    #[test_case("http://127.0.0.1:8080/token", true  ; "localhost_valid")]
-    #[test_case("http://example.com/token",    false ; "http_rejected")]
-    #[test_case("ftp://example.com/token",     false ; "ftp_rejected")]
+    #[test_case("https://example.com/token",        true  ; "https_valid")]
+    #[test_case("http://127.0.0.1:8080/token",      true  ; "loopback_ip_with_port_valid")]
+    #[test_case("http://localhost/token",           true  ; "localhost_valid")]
+    #[test_case("http://localhost:3000/token",      true  ; "localhost_with_port_valid")]
+    #[test_case("http://localhost.evil.com/token",  false ; "localhost_subdomain_rejected")]
+    #[test_case("http://127.0.0.1.evil.com/token",  false ; "loopback_subdomain_rejected")]
+    #[test_case("http://localhost@evil.com/token",  false ; "userinfo_spoof_rejected")]
+    #[test_case("http://example.com/token",         false ; "http_rejected")]
+    #[test_case("ftp://example.com/token",          false ; "ftp_rejected")]
     fn endpoint_url_validation(url: &str, should_pass: bool) {
         assert_eq!(validate_endpoint_url(url).is_ok(), should_pass);
     }

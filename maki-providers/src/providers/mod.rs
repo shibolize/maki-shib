@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
+use flume::Sender;
 use futures_lite::StreamExt;
 use futures_lite::io::{AsyncBufRead, AsyncRead};
 use isahc::config::{Configurable, VersionNegotiation};
@@ -17,10 +19,10 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
 use maki_storage::sessions::wire_logs_dir;
 
-use crate::AgentError;
 use crate::model::ModelInfo;
 use crate::retry::RetryPolicy;
 use crate::wire_log;
+use crate::{AgentError, ProviderEvent, StreamResponse};
 
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
@@ -676,11 +678,15 @@ pub fn update_api_log_symlink(
 
 #[derive(Clone, Debug)]
 pub struct KeyPool {
-    keys: Arc<Vec<String>>,
+    keys: Arc<Mutex<Vec<String>>>,
     index: Arc<AtomicUsize>,
 }
 
 impl KeyPool {
+    pub fn empty() -> Self {
+        Self::from_keys(Vec::new())
+    }
+
     pub fn from_env(env_var: &str) -> Result<Self, AgentError> {
         let raw = std::env::var(env_var).map_err(|_| AgentError::Config {
             message: format!("{env_var} not set"),
@@ -695,18 +701,25 @@ impl KeyPool {
                 message: format!("{env_var} is empty"),
             });
         }
-        Ok(Self {
-            keys: Arc::new(keys),
-            index: Arc::new(AtomicUsize::new(0)),
-        })
+        Ok(Self::from_keys(keys))
     }
 
     pub fn resolve(slug: &str, env_var: &str) -> Result<Self, AgentError> {
-        if let Ok(pool) = Self::from_env(env_var) {
+        Self::resolve_in(slug, env_var, None)
+    }
+
+    pub fn resolve_in(
+        slug: &str,
+        env_var: &str,
+        dir: Option<&StateDir>,
+    ) -> Result<Self, AgentError> {
+        if !env_var.is_empty()
+            && let Ok(pool) = Self::from_env(env_var)
+        {
             debug!(slug, keys = pool.len(), "resolved API key from env");
             return Ok(pool);
         }
-        if let Some(key) = Self::key_from_file(slug) {
+        if let Some(key) = Self::key_from_file(slug, dir) {
             debug!(slug, "resolved API key from saved credentials");
             return Ok(Self::from_keys(vec![key]));
         }
@@ -714,19 +727,29 @@ impl KeyPool {
             debug!(slug, "resolved API key from providers.toml");
             return Ok(Self::from_keys(vec![key]));
         }
-        Err(AgentError::Config {
-            message: format!(
+        let message = if env_var.is_empty() {
+            format!("no saved credentials for '{slug}' — run `maki auth login {slug}`")
+        } else {
+            format!(
                 "{env_var} not set and no saved credentials for '{slug}' — run `maki auth login {slug}`"
-            ),
-        })
+            )
+        };
+        Err(AgentError::Config { message })
     }
 
-    fn key_from_file(slug: &str) -> Option<String> {
-        let dir = maki_storage::StateDir::resolve().ok()?;
-        maki_storage::auth::load_provider_credentials(&dir, slug).map(|c| c.api_key)
+    fn key_from_file(slug: &str, dir: Option<&StateDir>) -> Option<String> {
+        let owned;
+        let dir = match dir {
+            Some(d) => d,
+            None => {
+                owned = maki_storage::StateDir::resolve().ok()?;
+                &owned
+            }
+        };
+        maki_storage::auth::load_provider_credentials(dir, slug).map(|c| c.api_key)
     }
 
-    fn key_from_config(slug: &str) -> Option<String> {
+    pub(crate) fn key_from_config(slug: &str) -> Option<String> {
         maki_config::providers::ProvidersConfig::load()
             .get(slug)
             .and_then(|d| d.api_key.clone())
@@ -736,25 +759,43 @@ impl KeyPool {
     /// them from.
     pub fn from_keys(keys: Vec<String>) -> Self {
         Self {
-            keys: Arc::new(keys),
+            keys: Arc::new(Mutex::new(keys)),
             index: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub fn current(&self) -> &str {
-        &self.keys[self.index.load(Ordering::Relaxed) % self.keys.len()]
+    pub fn replace(&self, other: Self) {
+        let new_keys = other
+            .keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *self.keys.lock().unwrap_or_else(|e| e.into_inner()) = new_keys;
+        self.index.store(0, Ordering::Relaxed);
+    }
+
+    pub fn current(&self) -> String {
+        let keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        if keys.is_empty() {
+            return String::new();
+        }
+        keys[self.index.load(Ordering::Relaxed) % keys.len()].clone()
     }
 
     pub fn rotate(&self) -> bool {
-        if self.keys.len() <= 1 {
+        if self.len() <= 1 {
             return false;
         }
         self.index.fetch_add(1, Ordering::Relaxed);
         true
     }
 
-    fn len(&self) -> usize {
-        self.keys.len()
+    pub(crate) fn len(&self) -> usize {
+        self.keys.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -771,14 +812,14 @@ pub enum KeyHeader {
 }
 
 impl KeyHeader {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Bearer => AUTHORIZATION_HEADER,
             Self::Raw(name) => name,
         }
     }
 
-    fn value(self, key: &str) -> String {
+    pub(crate) fn value(self, key: &str) -> String {
         match self {
             Self::Bearer => bearer_value(key),
             Self::Raw(_) => key.to_string(),
@@ -809,10 +850,11 @@ impl<'a> KeyRotation<'a> {
         if !self.pool.rotate() {
             return false;
         }
+        let current = self.pool.current();
         self.auth
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .set_key_header(self.header.name(), self.header.value(self.pool.current()));
+            .set_key_header(self.header.name(), self.header.value(&current));
         true
     }
 }
@@ -824,7 +866,53 @@ pub(crate) fn key_rotation<'a>(
     auth: &'a Mutex<ResolvedAuth>,
     header: KeyHeader,
 ) -> Option<KeyRotation<'a>> {
-    Some(KeyRotation::new(pool.as_ref()?, auth, header))
+    let pool = pool.as_ref().filter(|p| !p.is_empty())?;
+    Some(KeyRotation::new(pool, auth, header))
+}
+
+pub(crate) fn reload_key_pool(
+    slug: &str,
+    env_var: &str,
+    pool: &Option<KeyPool>,
+    auth: &Mutex<ResolvedAuth>,
+    header: KeyHeader,
+) -> Result<(), AgentError> {
+    let Some(pool) = pool else {
+        return Ok(());
+    };
+    let new_pool = KeyPool::resolve(slug, env_var)?;
+    let key = new_pool.current();
+    pool.replace(new_pool);
+    auth.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_key_header(header.name(), header.value(&key));
+    Ok(())
+}
+
+/// Streams `attempt_fn` through a counting relay channel so callers doing an
+/// in-band retry (e.g. 401 token refresh or reasoning-summary fallback) can
+/// check `forwarded == 0` and avoid replaying deltas after partial output.
+pub(crate) async fn run_stream_attempt<F, Fut>(
+    event_tx: &Sender<ProviderEvent>,
+    attempt_fn: F,
+) -> (Result<StreamResponse, AgentError>, usize)
+where
+    F: FnOnce(Sender<ProviderEvent>) -> Fut,
+    Fut: Future<Output = Result<StreamResponse, AgentError>>,
+{
+    let (tx, rx) = flume::unbounded();
+    let attempt = attempt_fn(tx);
+    let forward = async move {
+        let mut forwarded = 0usize;
+        while let Ok(ev) = rx.recv_async().await {
+            forwarded += 1;
+            if event_tx.send_async(ev).await.is_err() {
+                break;
+            }
+        }
+        forwarded
+    };
+    futures_lite::future::zip(attempt, forward).await
 }
 
 #[cfg(test)]
@@ -1121,7 +1209,7 @@ mod tests {
     #[test]
     fn rotate_keeps_base_url_and_config_headers() {
         let pool = two_key_pool();
-        let mut auth = test_bearer(pool.current());
+        let mut auth = test_bearer(&pool.current());
         auth.base_url = Some(GATEWAY_URL.into());
         auth.apply_config_headers(TEST_SLUG, &config_headers(&[(GATEWAY_HEADER, GATEWAY_ID)]))
             .unwrap();
@@ -1144,7 +1232,7 @@ mod tests {
     #[test]
     fn rotate_keeps_a_configured_auth_header() {
         let pool = two_key_pool();
-        let mut auth = test_bearer(pool.current());
+        let mut auth = test_bearer(&pool.current());
         auth.apply_config_headers(
             TEST_SLUG,
             &config_headers(&[("Authorization", GATEWAY_CRED)]),
@@ -1175,7 +1263,7 @@ mod tests {
         let auth = Mutex::new(ResolvedAuth::for_test(
             None,
             vec![
-                (name.into(), header.value(pool.current())),
+                (name.into(), header.value(&pool.current())),
                 (TRACE_HEADER.into(), TRACE_ID.into()),
             ],
         ));
@@ -1195,5 +1283,28 @@ mod tests {
 
         assert!(!KeyRotation::new(&pool, &auth, KeyHeader::Bearer).rotate());
         assert_eq!(pool.current(), KEY_1);
+    }
+
+    #[test_case(&["sk-new-1", "sk-new-2"], "sk-new-1", true ; "replaces_with_multiple_keys")]
+    #[test_case(&[], "", false ; "replaces_with_empty_pool")]
+    fn key_pool_replace_resets_index_and_updates_keys(
+        new_keys: &[&str],
+        expected_current: &str,
+        expect_rotation: bool,
+    ) {
+        let pool = two_key_pool();
+        assert!(pool.rotate());
+        assert_eq!(pool.current(), KEY_2);
+
+        let replacement = KeyPool::from_keys(new_keys.iter().map(|s| (*s).to_string()).collect());
+        pool.replace(replacement);
+        assert_eq!(pool.current(), expected_current);
+
+        let pool_opt = Some(pool);
+        let auth = Mutex::new(test_bearer(KEY_1));
+        assert_eq!(
+            key_rotation(&pool_opt, &auth, KeyHeader::Bearer).is_some(),
+            expect_rotation
+        );
     }
 }

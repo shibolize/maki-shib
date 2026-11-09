@@ -66,7 +66,18 @@ pub fn base_spec(slug: &str) -> Option<&'static ProviderSpec> {
     protocol_spec(config.get(slug)?.protocol?)
 }
 
-fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
+fn protocol_key_header(protocol: Protocol) -> super::KeyHeader {
+    match protocol {
+        Protocol::Openai | Protocol::OpenaiResponses => super::KeyHeader::Bearer,
+        Protocol::Anthropic => super::KeyHeader::Raw("x-api-key"),
+        Protocol::Google => super::KeyHeader::Raw("x-goog-api-key"),
+    }
+}
+
+fn resolve_custom_auth(
+    slug: &str,
+    protocol: Protocol,
+) -> Result<(ResolvedAuth, super::KeyPool), AgentError> {
     let config = ProvidersConfig::load();
     let def = config.get(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown custom provider '{slug}'"),
@@ -75,11 +86,12 @@ fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
     let resolved_env = resolve_api_key_env(slug, Some(def));
     let env_var = def.api_key_env.as_deref().unwrap_or(&resolved_env);
     let pool = super::KeyPool::resolve(slug, env_var)?;
+    let header = protocol_key_header(protocol);
+    let key = pool.current();
+    let auth = ResolvedAuth::new(slug, vec![(header.name().into(), header.value(&key))])?
+        .with_base_url(resolve_base_url(slug, Some(def)));
 
-    Ok(
-        ResolvedAuth::bearer(slug, pool.current())?
-            .with_base_url(resolve_base_url(slug, Some(def))),
-    )
+    Ok((auth, pool))
 }
 
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -90,7 +102,7 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
         .ok_or_else(|| AgentError::Config {
             message: format!("unknown custom provider '{slug}'"),
         })?;
-    let resolved = resolve_custom_auth(slug)?;
+    let (resolved, pool) = resolve_custom_auth(slug, protocol)?;
     let auth = Arc::new(Mutex::new(resolved));
 
     match protocol {
@@ -98,8 +110,10 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
             auth, timeouts,
         )?)),
         Protocol::Openai | Protocol::OpenaiResponses => Ok(Box::new(CustomOpenAiProvider {
+            slug: slug.to_string(),
             compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, timeouts)?,
             auth,
+            key_pool: Some(pool),
             protocol,
         })),
         Protocol::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts)?)),
@@ -382,8 +396,10 @@ fn apply_chat_thinking(thinking: ThinkingConfig, body: &mut Value, model: &Model
 }
 
 struct CustomOpenAiProvider {
+    slug: String,
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
+    key_pool: Option<super::KeyPool>,
     protocol: Protocol,
 }
 
@@ -426,6 +442,25 @@ impl Provider for CustomOpenAiProvider {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Box::pin(async move { self.compat.do_list_models(&auth).await })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            let (resolved, new_pool) = resolve_custom_auth(&self.slug, self.protocol)?;
+            if let Some(pool) = &self.key_pool {
+                pool.replace(new_pool);
+            }
+            *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = resolved;
+            Ok(())
+        })
+    }
+
+    fn keys(&self) -> Option<super::KeyRotation<'_>> {
+        super::key_rotation(
+            &self.key_pool,
+            &self.auth,
+            protocol_key_header(self.protocol),
+        )
     }
 }
 
@@ -654,5 +689,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(model.billed_cost(&usage, false), None);
+    }
+
+    #[test_case(Protocol::Openai, "authorization", "Bearer sk-test" ; "openai_uses_bearer")]
+    #[test_case(Protocol::OpenaiResponses, "authorization", "Bearer sk-test" ; "openai_responses_uses_bearer")]
+    #[test_case(Protocol::Anthropic, "x-api-key", "sk-test" ; "anthropic_uses_x_api_key")]
+    #[test_case(Protocol::Google, "x-goog-api-key", "sk-test" ; "google_uses_x_goog_api_key")]
+    fn custom_protocol_uses_native_key_header(
+        protocol: Protocol,
+        expected_name: &str,
+        expected_value: &str,
+    ) {
+        let header = protocol_key_header(protocol);
+        assert_eq!(header.name(), expected_name);
+        assert_eq!(header.value("sk-test"), expected_value);
     }
 }

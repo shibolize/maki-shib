@@ -210,6 +210,7 @@ fn native_route_model(model: &Model, spec: &'static ProviderSpec, bare_model_id:
 pub struct Aperture {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
+    external_auth: bool,
     timeouts: Timeouts,
     system_prefix: Option<String>,
     overrides: Overrides,
@@ -221,7 +222,9 @@ impl Aperture {
         let auth = Arc::new(Mutex::new(
             ResolvedAuth::new(CONFIG.slug, Vec::new())?.with_base_url(Some(base_url)),
         ));
-        Self::with_auth_and_overrides(auth, timeouts, load_overrides())
+        let mut provider = Self::with_auth_and_overrides(auth, timeouts, load_overrides())?;
+        provider.external_auth = false;
+        Ok(provider)
     }
 
     pub(crate) fn with_auth(
@@ -241,6 +244,7 @@ impl Aperture {
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth,
+            external_auth: true,
             timeouts,
             system_prefix: None,
             overrides,
@@ -401,6 +405,18 @@ impl Provider for Aperture {
                 .await?;
             let body: Value = serde_json::from_str(&text)?;
             Ok(parse_models(&body, &self.overrides))
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            if self.external_auth {
+                return Ok(());
+            }
+            let base_url = resolve_base_url()?;
+            *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
+                ResolvedAuth::new(CONFIG.slug, Vec::new())?.with_base_url(Some(base_url));
+            Ok(())
         })
     }
 

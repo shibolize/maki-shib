@@ -865,7 +865,7 @@ mod tests {
     impl PooledServer {
         fn new(keys: usize, status: u16, relents_for: Option<&'static str>) -> Self {
             let pool = KeyPool::from_keys(POOL_KEYS[..keys].iter().map(|k| (*k).into()).collect());
-            let auth = ResolvedAuth::bearer(POOLED_SLUG, pool.current()).unwrap();
+            let auth = ResolvedAuth::bearer(POOLED_SLUG, &pool.current()).unwrap();
             Self {
                 pool,
                 auth: Mutex::new(auth),
@@ -892,7 +892,7 @@ mod tests {
             _: Option<&'a SessionRef>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
-                let key = self.pool.current().to_owned();
+                let key = self.pool.current();
                 let relents = self.relents_for == Some(key.as_str());
                 self.seen.lock().unwrap().push(key);
                 if !relents {

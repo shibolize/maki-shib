@@ -61,7 +61,9 @@ pub async fn register_client(
         })?
         .to_string();
     let client_secret = resp["client_secret"].as_str().map(String::from);
-    let client_secret_expires_at = resp["client_secret_expires_at"].as_u64();
+    let client_secret_expires_at = resp["client_secret_expires_at"]
+        .as_u64()
+        .filter(|&t| t > 0);
 
     Ok(ClientRegistration {
         client_id,

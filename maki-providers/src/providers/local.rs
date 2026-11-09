@@ -38,10 +38,18 @@ fn resolve_protocol_for_local(slug: &str) -> Option<Protocol> {
     )
 }
 
+fn normalize_local_base_url(host: &str) -> String {
+    let trimmed = host.trim().trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    format!("{root}/v1")
+}
+
 pub(crate) struct LocalEndpoint {
+    cfg: &'static LocalEndpointConfig,
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
+    external_auth: bool,
     system_prefix: Option<String>,
     thinking_fallback: ThinkingFallback,
     discovery_mode: DiscoveryMode,
@@ -73,9 +81,11 @@ impl LocalEndpoint {
         timeouts: super::Timeouts,
     ) -> Result<Self, AgentError> {
         Ok(Self {
+            cfg,
             compat: OpenAiCompatProvider::new(&cfg.compat, timeouts)?,
             auth,
             key_pool: None,
+            external_auth: true,
             system_prefix: None,
             thinking_fallback: cfg.thinking_fallback,
             discovery_mode: cfg.discovery_mode,
@@ -88,16 +98,14 @@ impl LocalEndpoint {
         self
     }
 
-    fn build(
+    fn resolve_auth_and_pool(
         cfg: &'static LocalEndpointConfig,
-        timeouts: super::Timeouts,
         key_pool: Option<KeyPool>,
         host: Option<String>,
-        protocol: Option<Protocol>,
-    ) -> Result<Self, AgentError> {
-        let api_key = key_pool.as_ref().map(|p| p.current().to_string());
+    ) -> Result<(ResolvedAuth, KeyPool), AgentError> {
+        let api_key = key_pool.as_ref().map(|p| p.current());
         let base_url = match host {
-            Some(h) => format!("{h}/v1"),
+            Some(h) => normalize_local_base_url(&h),
             None if api_key.is_some() && cfg.cloud_fallback_url.is_some() => {
                 cfg.cloud_fallback_url.unwrap().to_string()
             }
@@ -111,12 +119,24 @@ impl LocalEndpoint {
             Some(key) => vec![("authorization".into(), format!("Bearer {key}"))],
             None => Vec::new(),
         };
-        let compat_config = &cfg.compat;
         let auth = ResolvedAuth::new(cfg.slug, headers)?.with_base_url(Some(base_url));
+        Ok((auth, key_pool.unwrap_or_else(KeyPool::empty)))
+    }
+
+    fn build(
+        cfg: &'static LocalEndpointConfig,
+        timeouts: super::Timeouts,
+        key_pool: Option<KeyPool>,
+        host: Option<String>,
+        protocol: Option<Protocol>,
+    ) -> Result<Self, AgentError> {
+        let (auth, pool) = Self::resolve_auth_and_pool(cfg, key_pool, host)?;
         Ok(Self {
-            compat: OpenAiCompatProvider::new(compat_config, timeouts)?,
+            cfg,
+            compat: OpenAiCompatProvider::new(&cfg.compat, timeouts)?,
             auth: Arc::new(Mutex::new(auth)),
-            key_pool,
+            key_pool: Some(pool),
+            external_auth: false,
             system_prefix: None,
             thinking_fallback: cfg.thinking_fallback,
             discovery_mode: cfg.discovery_mode,
@@ -176,6 +196,25 @@ impl Provider for LocalEndpoint {
                 DiscoveryMode::LlamaCpp => self.discover_llamacpp_models(&auth).await,
                 DiscoveryMode::Ollama => self.discover_ollama_models(&auth).await,
             }
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            if self.external_auth {
+                return Ok(());
+            }
+            let key_pool = KeyPool::resolve(self.cfg.slug, self.cfg.api_key_env).ok();
+            let host = maki_config::providers::ProvidersConfig::load()
+                .get(self.cfg.slug)
+                .and_then(|d| d.base_url.clone())
+                .or_else(|| std::env::var(self.cfg.host_env).ok());
+            let (auth, new_pool) = Self::resolve_auth_and_pool(self.cfg, key_pool, host)?;
+            if let Some(pool) = &self.key_pool {
+                pool.replace(new_pool);
+            }
+            *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = auth;
+            Ok(())
         })
     }
 
@@ -1108,6 +1147,20 @@ mod tests {
                 seed 1234
                 ";
             assert_eq!(ollama_extract_num_ctx(params), Some(131072));
+        }
+    }
+
+    mod normalize_base_url {
+        use test_case::test_case;
+
+        use super::super::*;
+
+        #[test_case("http://localhost:11434", "http://localhost:11434/v1" ; "bare_host")]
+        #[test_case("http://localhost:11434/", "http://localhost:11434/v1" ; "trailing_slash")]
+        #[test_case("http://localhost:11434/v1", "http://localhost:11434/v1" ; "already_has_v1")]
+        #[test_case("http://localhost:11434/v1/", "http://localhost:11434/v1" ; "v1_with_trailing_slash")]
+        fn normalizes(input: &str, expected: &str) {
+            assert_eq!(normalize_local_base_url(input), expected);
         }
     }
 }
