@@ -989,10 +989,7 @@ impl Provider for CatalogProvider {
             if let Some(pool) = &self.key_pool {
                 pool.replace(new_pool);
             }
-            *self
-                .resolved_auth
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = new_resolved;
+            *self.resolved_auth.lock().unwrap_or_else(|e| e.into_inner()) = new_resolved;
             *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = new_auth;
             Ok(())
         })

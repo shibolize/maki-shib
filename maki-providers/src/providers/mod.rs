@@ -765,11 +765,7 @@ impl KeyPool {
     }
 
     pub fn replace(&self, other: Self) {
-        let new_keys = other
-            .keys
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let new_keys = other.keys.lock().unwrap_or_else(|e| e.into_inner()).clone();
         *self.keys.lock().unwrap_or_else(|e| e.into_inner()) = new_keys;
         self.index.store(0, Ordering::Relaxed);
     }

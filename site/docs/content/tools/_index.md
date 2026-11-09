@@ -246,6 +246,18 @@ Save and retrieve concise project facts across sessions. Reuse relevant tags fro
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
 
+### `transcript` {#transcript}
+
+Your own earlier output: search it, preview what a ⟦first…last⟧ quote pastes, or list drafts and clips. search: regex over everything you wrote, newest first, each hit tagged with where it is. copy: resolve a quote and show the text; with name, save it so ⟦@name⟧ pastes it later. list: drafts (draft:<path>) and clips (@name).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `command` | string | yes |  | search: pattern (regex), optional limit. copy: quote, optional name. list: no arguments |
+| `limit` | integer | no | 20 | Most hits to return |
+| `name` | string | no |  | Save the copied text as a clip pasted with ⟦@name⟧ |
+| `pattern` | string | no |  | Regex matched against each line you wrote |
+| `quote` | string | no |  | A ⟦first…last⟧ or ⟦@name⟧ quote, literal text allowed around it |
+
 ### `custom_tools` {#custom_tools}
 
 Persist helper tools across sessions: scripts (bash, python) or small projects in any language, built wherever you like inside the project with write/edit, then registered here so later sessions can find and run them from bash. When you are about to write a script for a task you may face again (project-specific build/test/search/git chores), build it in the project, register it once, and reuse it instead of reinventing it. Before writing a new helper, `list` existing ones to avoid duplicates; `info` shows metadata and help without the source; `read` returns the source. A file tool must run from bash, support `--help`, and document its arguments. A command tool is defined by its `body` and needs no project file. Register one only when it saves tokens and will be reused in later sessions or more than three times in this session; do not build tools for their own sake. list: optional tags, query, and group_by='tag'; returns one row per tool by default. info: path, tags, or query; returns description, tags, and help or the command body without the source. read: path or tags; returns source or command body. write: registers an existing project file (path relative to the project root); omitted tags are derived from the path and an omitted description from the leading comment; it verifies `--help` and warns on failure. Pass `body` to define a command tool instead: the body is a shell command and no project file is required. Re-registering updates tags/description/body without re-sending the file. delete: unregisters; the file stays. Edit a registered tool directly with write/edit; re-register only to change tags or description.
@@ -296,17 +308,3 @@ Search the web using Exa AI. Today's date is YYYY-MM-DD. Returns titles, URLs, a
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
-
-## Additional tools
-
-### `transcript` {#transcript}
-
-Your own earlier output: search it, preview what a ⟦first…last⟧ quote pastes, or list drafts and clips. search: regex over everything you wrote, newest first, each hit tagged with where it is. copy: resolve a quote and show the text; with name, save it so ⟦@name⟧ pastes it later. list: drafts (draft:<path>) and clips (@name).
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `command` | string | yes |  | search: pattern (regex), optional limit. copy: quote, optional name. list: no arguments |
-| `limit` | integer | no | 20 | Most hits to return |
-| `name` | string | no |  | Save the copied text as a clip pasted with ⟦@name⟧ |
-| `pattern` | string | no |  | Regex matched against each line you wrote |
-| `quote` | string | no |  | A ⟦first…last⟧ or ⟦@name⟧ quote, literal text allowed around it |

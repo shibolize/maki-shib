@@ -323,7 +323,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         save_mcp_auth(&dir, "srv", &data).unwrap();
-        assert_eq!(load_mcp_auth(&dir, "srv", lookup_url).is_some(), expected_some);
+        assert_eq!(
+            load_mcp_auth(&dir, "srv", lookup_url).is_some(),
+            expected_some
+        );
     }
 
     #[test_case("openai" ; "reacquire_existing_lock_file")]
